@@ -60,16 +60,33 @@
   .badge.gross { background: rgba(126, 209, 168, 0.15); color: var(--gross); }
   .tab-content { display: none; }
   .tab-content.active { display: block; }
-  /* Monthly LOS Table sticky behavior */
-  /* Controls stick to viewport top on vertical scroll */
-  .mlos-sticky-top { position: sticky; top: 0; z-index: 25; background: var(--bg);
+  /* ---------- Monthly LOS Table sticky behavior ---------- */
+  /* Controls stick to viewport top on vertical scroll.
+     The .mlos-sticky-top wrapper contains the title + asset selectors + filters. */
+  .mlos-sticky-top { position: sticky; top: 0; z-index: 30; background: #0a0a0b;
                      padding: 10px 0 8px; border-bottom: 1px solid var(--border);
                      margin: 0 -18px 0 -18px; padding-left: 18px; padding-right: 18px; }
-  /* First column (line-item labels) sticks to left on horizontal scroll */
+
+  /* Panel hosts horizontal scroll for the wide table.
+     overflow-y:clip lets sticky children stick relative to the PAGE, not the panel. */
+  #mlos-panel { overflow-x: auto; overflow-y: clip; }
+
+  /* thead (dates row) sticks to top, below the .mlos-sticky-top controls.
+     --thead-top is set by JS at render time based on controls offsetHeight. */
+  #mlos-table thead th { position: sticky; top: var(--thead-top, 0px);
+                         background: #141416; z-index: 20;
+                         box-shadow: 0 1px 0 var(--border); }
+
+  /* First column (line-item labels) sticks to left on horizontal scroll.
+     Explicit opaque background + higher z-index + box-shadow to cleanly hide
+     cells scrolling underneath. */
   #mlos-table td.first-col, #mlos-table th.first-col {
-    position: sticky; left: 0; background: var(--panel); z-index: 5; }
-  #mlos-table thead th.first-col { background: var(--panel); z-index: 6; }
-  #mlos-table tr:hover td.first-col { background: var(--panel2); }
+    position: sticky; left: 0; background: #141416 !important; z-index: 10;
+    box-shadow: 1px 0 0 var(--border); }
+  /* Top-left corner cell — must be above both row sticky (z:10) and col sticky (z:20) */
+  #mlos-table thead th.first-col { z-index: 25; background: #141416 !important; }
+  #mlos-table tr:hover td.first-col { background: #1c1c20 !important; }
+  .child-row td.first-col { background: #141416 !important; }
   /* Expander caret */
   .expander { cursor: pointer; user-select: none; }
   .expander .caret { display: inline-block; width: 10px; margin-right: 4px;
@@ -773,6 +790,15 @@ function renderMonthly() {
   const wrap = el("div",{id:"mlos-wrap"});
   root.appendChild(wrap);
 
+  // After layout, read the sticky control block height and set --thead-top
+  // so the dates row sticks directly below it.
+  const updateStickyOffset = function() {
+    const h = stickyTop.offsetHeight;
+    // Set on root so any descendant thead can use it via var(--thead-top)
+    document.documentElement.style.setProperty("--thead-top", h + "px");
+  };
+  window.addEventListener("resize", updateStickyOffset);
+
   const build = function() {
     const basis = document.getElementById("mlos-basis").value;
     const yearFilter = document.getElementById("mlos-year").value;
@@ -899,7 +925,7 @@ function renderMonthly() {
       return;
     }
 
-    const panel = el("div",{cls:"panel",style:"overflow-x:auto;"});
+    const panel = el("div",{id:"mlos-panel",cls:"panel"});
     const table = el("table",{id:"mlos-table",style:"min-width:100%;"});
     const thead = el("thead");
     // Header row: line item | Period1 | Period2 | ... | Total
@@ -1002,8 +1028,11 @@ function renderMonthly() {
     };
 
     for (const sec of sections) {
-      const hdrRow = el("tr",{style:"background:var(--panel2);"});
-      const hdrTd = el("td",{cls:"first-col",style:"background:var(--panel2); font-weight:600; color:var(--text-dim); text-transform:uppercase; letter-spacing:0.05em; font-size:10px;", text:sec.title});
+      const hdrRow = el("tr",{cls:"mlos-section-hdr",style:"background:#1c1c20;"});
+      // Section headers span the whole row; don't apply first-col sticky logic
+      // (would be overridden by the !important opaque rule and lose the accent color).
+      // Instead, use a sticky-left wrapper via CSS below and keep the accent color.
+      const hdrTd = el("td",{style:"position:sticky; left:0; background:#1c1c20; z-index:10; font-weight:600; color:var(--text-dim); text-transform:uppercase; letter-spacing:0.05em; font-size:10px;", text:sec.title});
       hdrTd.colSpan = periods.length + 2;
       hdrRow.appendChild(hdrTd);
       tbody.appendChild(hdrRow);
@@ -1114,6 +1143,9 @@ function renderMonthly() {
     table.appendChild(tbody);
     panel.appendChild(table);
     wrap.appendChild(panel);
+    // Measure the sticky-top height and propagate to thead via --thead-top.
+    // RAF ensures the browser has applied sticky positioning first.
+    requestAnimationFrame(updateStickyOffset);
   };
 
   assetCtrl.querySelectorAll("input").forEach(function(cb){ cb.addEventListener("change", build); });
