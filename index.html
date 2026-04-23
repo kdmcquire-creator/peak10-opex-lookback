@@ -544,6 +544,37 @@ function renderTrends() {
   p7.appendChild(el("canvas",{id:"chart-opexint",cls:"chart-wrap tall"}));
   root.appendChild(p7);
 
+  // ---- Chart 8: Opex per-unit (Var + Fix only; EXCLUDES workover + capex) — quarterly by asset ----
+  // Toggle between $/bbl (oil bbl basis) and $/BOE (total BOE basis)
+  const h8 = el("h2");
+  h8.textContent = "Opex per Unit — Quarterly by Asset ";
+  const unitToggle = el("div",{style:"display:inline-flex; gap:2px; margin-left:12px; background:var(--panel2); padding:3px; border-radius:5px; border:1px solid var(--border); vertical-align:middle;"});
+  const unitBtn = function(val, label, isActive){
+    const b = el("button",{attrs:{"data-unit":val},style:"background:"+(isActive?"var(--panel)":"transparent")+"; color:"+(isActive?"var(--text)":"var(--text-dim)")+"; border:none; padding:5px 12px; border-radius:3px; cursor:pointer; font-size:12px; font-family:inherit; font-weight:500;"});
+    b.textContent = label;
+    return b;
+  };
+  const btnBOE = unitBtn("BOE","$/BOE",true);
+  const btnBBL = unitBtn("BBL","$/bbl (oil)",false);
+  unitToggle.appendChild(btnBOE);
+  unitToggle.appendChild(btnBBL);
+  h8.appendChild(unitToggle);
+  root.appendChild(h8);
+  root.appendChild(el("div",{cls:"dim",style:"font-size:11px; margin-top:-6px; margin-bottom:8px;",text:"Note: Opex = Variable Opex + Fixed Opex (excludes workover and capex). $/bbl uses oil volume only; $/BOE uses total BOE."}));
+  const p8 = el("div",{cls:"panel"});
+  p8.appendChild(el("canvas",{id:"chart-opexunit",cls:"chart-wrap tall"}));
+  root.appendChild(p8);
+  let opexUnit = "BOE";
+  const setOpexUnit = function(u){
+    opexUnit = u;
+    btnBOE.style.background = u==="BOE" ? "var(--panel)" : "transparent";
+    btnBOE.style.color      = u==="BOE" ? "var(--text)" : "var(--text-dim)";
+    btnBBL.style.background = u==="BBL" ? "var(--panel)" : "transparent";
+    btnBBL.style.color      = u==="BBL" ? "var(--text)" : "var(--text-dim)";
+  };
+  btnBOE.addEventListener("click", function(){ setOpexUnit("BOE"); render(); });
+  btnBBL.addEventListener("click", function(){ setOpexUnit("BBL"); render(); });
+
   // ---------- Helpers for quarterly aggregation ----------
   const getSelectedAssets = function() {
     const out = [];
@@ -563,7 +594,7 @@ function renderTrends() {
       const qkey = r.Year + "-Q" + q;
       if (!qMap[qkey]) qMap[qkey] = {};
       if (!qMap[qkey][r.Asset]) qMap[qkey][r.Asset] = {
-        Revenue:0, Cash:0, Capex:0, EBITDA:0, BOE:0, Months:0,
+        Revenue:0, Cash:0, Capex:0, EBITDA:0, BOE:0, Oil:0, Months:0,
         Var:0, Fix:0, WO:0, Netback:0, Sev:0, Adval:0, NetRev:0,
       };
       const a = qMap[qkey][r.Asset];
@@ -576,13 +607,15 @@ function renderTrends() {
       a.Adval += r.Adval;
       a.Capex += r.Total_Capex;
       a.BOE += r.BOE;
+      a.Oil += r.Oil_bbl;
       if (r.ActiveWells > 0) a.Months += 1;
     }
     // Sort labels chronologically
     const labels = Object.keys(qMap).sort();
     const byAsset = {};
     const metricKeys = ["Revenue","Cash","Capex","EBITDA","EBITDA_Margin",
-                        "FCF","FCF_Margin","BOE","BOEd","CashPerBOE","OpexIntensity"];
+                        "FCF","FCF_Margin","BOE","BOEd","CashPerBOE","OpexIntensity",
+                        "OpexPerBOE","OpexPerBBL"];
     ASSETS_WITH_CONSOL.forEach(function(asset){
       byAsset[asset] = {};
       metricKeys.forEach(function(k){ byAsset[asset][k] = []; });
@@ -598,10 +631,11 @@ function renderTrends() {
       for (const asset of ASSETS_NO_CONSOL) {
         const a = perAsset[asset];
         if (!a) continue;
-        if (!consAgg) consAgg = {Revenue:0,Var:0,Fix:0,WO:0,Netback:0,Sev:0,Adval:0,Capex:0,BOE:0,Months:0};
+        if (!consAgg) consAgg = {Revenue:0,Var:0,Fix:0,WO:0,Netback:0,Sev:0,Adval:0,Capex:0,BOE:0,Oil:0,Months:0};
         consAgg.Revenue += a.Revenue; consAgg.Var += a.Var; consAgg.Fix += a.Fix;
         consAgg.WO += a.WO; consAgg.Netback += a.Netback; consAgg.Sev += a.Sev;
         consAgg.Adval += a.Adval; consAgg.Capex += a.Capex; consAgg.BOE += a.BOE;
+        consAgg.Oil += a.Oil;
         consAgg.Months = Math.max(consAgg.Months, a.Months);  // max months across assets in the quarter
       }
       perAsset.Consolidated = consAgg;
@@ -630,6 +664,10 @@ function renderTrends() {
         byAsset[asset].BOEd.push(a.BOE / days);
         byAsset[asset].CashPerBOE.push(a.BOE ? cashOpex / a.BOE : 0);
         byAsset[asset].OpexIntensity.push(a.Revenue ? cashOpex / a.Revenue : 0);
+        // Opex (Var+Fix only, NO workover or capex) per unit
+        const opexNoWO = a.Var + a.Fix;
+        byAsset[asset].OpexPerBOE.push(a.BOE ? opexNoWO / a.BOE : 0);
+        byAsset[asset].OpexPerBBL.push(a.Oil ? opexNoWO / a.Oil : 0);
       });
     }
     // Pretty labels: Q1-24, Q2-24, ...
@@ -756,6 +794,8 @@ function renderTrends() {
     makeBarChart("chart-cashcost","CashPerBOE",    "money2");
     makeBarChart("chart-capex",   "Capex",         "money");
     makeBarChart("chart-opexint", "OpexIntensity", "pct");
+    // Opex per-unit chart: toggle between $/BOE and $/bbl
+    makeBarChart("chart-opexunit", opexUnit === "BOE" ? "OpexPerBOE" : "OpexPerBBL", "money2");
   };
 
   saBasis.addEventListener("change", render);
