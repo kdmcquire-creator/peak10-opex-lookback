@@ -61,25 +61,39 @@
   .tab-content { display: none; }
   .tab-content.active { display: block; }
   /* ---------- Monthly LOS Table sticky behavior ---------- */
-  /* Controls stick to viewport top on vertical scroll.
+  /* Controls stick to viewport top on page scroll.
      The .mlos-sticky-top wrapper contains the title + asset selectors + filters. */
   .mlos-sticky-top { position: sticky; top: 0; z-index: 30; background: #0a0a0b;
                      padding: 10px 0 8px; border-bottom: 1px solid var(--border);
                      margin: 0 -18px 0 -18px; padding-left: 18px; padding-right: 18px; }
 
-  /* Panel hosts horizontal scroll for the wide table.
-     overflow-y:clip lets sticky children stick relative to the PAGE, not the panel. */
-  #mlos-panel { overflow-x: auto; overflow-y: clip; }
+  /* Panel is its own scroll container: internal horizontal AND vertical scrollbars.
+     This keeps the sticky thead + sticky first-col simple (they stick to the panel
+     edges) and fixes prior bleed-through issues by eliminating the panel-padding gap. */
+  #mlos-panel {
+    overflow: auto;
+    max-height: calc(100vh - 260px);
+    background: #141416;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    margin-bottom: 16px;
+  }
+  /* Visible scrollbars — dark-UI friendly */
+  #mlos-panel { scrollbar-width: auto; scrollbar-color: #5a5a60 #1c1c20; }
+  #mlos-panel::-webkit-scrollbar { width: 12px; height: 12px; }
+  #mlos-panel::-webkit-scrollbar-track { background: #1c1c20; }
+  #mlos-panel::-webkit-scrollbar-thumb { background: #5a5a60; border-radius: 6px; border: 2px solid #1c1c20; }
+  #mlos-panel::-webkit-scrollbar-thumb:hover { background: #9a9aa0; }
+  #mlos-panel::-webkit-scrollbar-corner { background: #1c1c20; }
 
-  /* thead (dates row) sticks to top, below the .mlos-sticky-top controls.
-     --thead-top is set by JS at render time based on controls offsetHeight. */
-  #mlos-table thead th { position: sticky; top: var(--thead-top, 0px);
+  /* thead (dates row) sticks to top of the panel's scroll viewport. */
+  #mlos-table thead th { position: sticky; top: 0;
                          background: #141416; z-index: 20;
                          box-shadow: 0 1px 0 var(--border); }
 
-  /* First column (line-item labels) sticks to left on horizontal scroll.
-     Explicit opaque background + higher z-index + box-shadow to cleanly hide
-     cells scrolling underneath. */
+  /* First column (line-item labels) sticks to left of the panel's scroll viewport.
+     Panel has no padding, so first-col's left:0 is flush with the panel edge — no
+     gap for cells to bleed through. Explicit opaque background + z-index hierarchy. */
   #mlos-table td.first-col, #mlos-table th.first-col {
     position: sticky; left: 0; background: #141416 !important; z-index: 10;
     box-shadow: 1px 0 0 var(--border); }
@@ -790,15 +804,6 @@ function renderMonthly() {
   const wrap = el("div",{id:"mlos-wrap"});
   root.appendChild(wrap);
 
-  // After layout, read the sticky control block height and set --thead-top
-  // so the dates row sticks directly below it.
-  const updateStickyOffset = function() {
-    const h = stickyTop.offsetHeight;
-    // Set on root so any descendant thead can use it via var(--thead-top)
-    document.documentElement.style.setProperty("--thead-top", h + "px");
-  };
-  window.addEventListener("resize", updateStickyOffset);
-
   const build = function() {
     const basis = document.getElementById("mlos-basis").value;
     const yearFilter = document.getElementById("mlos-year").value;
@@ -925,7 +930,9 @@ function renderMonthly() {
       return;
     }
 
-    const panel = el("div",{id:"mlos-panel",cls:"panel"});
+    // #mlos-panel is styled via CSS — NO .panel class (would add padding that
+    // creates a bleed-through gap between panel edge and sticky first-col).
+    const panel = el("div",{id:"mlos-panel"});
     const table = el("table",{id:"mlos-table",style:"min-width:100%;"});
     const thead = el("thead");
     // Header row: line item | Period1 | Period2 | ... | Total
@@ -1143,9 +1150,6 @@ function renderMonthly() {
     table.appendChild(tbody);
     panel.appendChild(table);
     wrap.appendChild(panel);
-    // Measure the sticky-top height and propagate to thead via --thead-top.
-    // RAF ensures the browser has applied sticky positioning first.
-    requestAnimationFrame(updateStickyOffset);
   };
 
   assetCtrl.querySelectorAll("input").forEach(function(cb){ cb.addEventListener("change", build); });
