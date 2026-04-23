@@ -1806,16 +1806,40 @@ function rollingStd(arr, win) {
   return out;
 }
 
+// A "stub month" is one where the asset has zero production/well-activity but
+// has posted costs (e.g. Feb-26 invoices for Jan-26 production not yet booked).
+// These months are NOT meaningful observations and shouldn't generate flags.
+// Rule: if ActiveWells at i === 0 AND the asset had activity in any prior month,
+// mark i as a stub. The month is still visible in sparklines (as a null point),
+// but excluded from anomaly detection.
+function buildStubMask(activeWellsSeries, boeSeries) {
+  const N = activeWellsSeries.length;
+  const mask = new Array(N).fill(false);
+  let hasSeenActivity = false;
+  for (let i = 0; i < N; i++) {
+    const aw = activeWellsSeries[i];
+    const boe = boeSeries ? boeSeries[i] : 0;
+    const active = (aw && aw > 0) || (boe && boe > 0);
+    if (active) hasSeenActivity = true;
+    // Stub = inactive month AFTER we've seen activity start
+    mask[i] = !active && hasSeenActivity;
+  }
+  return mask;
+}
+
 function detectAnomalies(series, opts) {
   opts = opts || {};
   const threshold = opts.threshold || 1.5;
   const minWarmup = opts.minWarmup || 6;
+  const stubMask = opts.stubMask || [];
   const N = series.length;
   const baseline = rollingMedian(series.slice(0, -1).concat([null]), 3);
   const longBase = rollingMean(series.slice(0, -1).concat([null]), 12);
   const std      = rollingStd(series.slice(0, -1).concat([null]), 6);
   const flags = [];
   for (let i = minWarmup; i < N; i++) {
+    // Skip stub months entirely (incomplete data — would generate false positives)
+    if (stubMask[i]) continue;
     const v = series[i];
     const b = baseline[i];
     const s = std[i];
@@ -2004,6 +2028,108 @@ function decomposeMarginChange(asset, year, month) {
 // ---- Narrative generator (rule-based, Phase 2) ----
 // Produces a 1-2 sentence plain-English summary for a flag using decomposition
 // and drill-down data when available.
+// ---- Event grouping (Phase 2.5) ----
+// Cluster flags that fire on the same asset within a ±1 month window. Related
+// flags usually share a root cause (e.g. a workover campaign drops EBITDA margin
+// AND spikes Workover $/Well AND Fixed Opex simultaneously). Grouping shows the
+// story as one "event" instead of 3-4 disconnected cards.
+function groupFlagsIntoEvents(flags, windowMonths) {
+  windowMonths = windowMonths || 1;
+  if (flags.length === 0) return [];
+  // Assumes flags already sorted by (asset, period ascending) within asset.
+  // Re-sort to ensure: asset asc, period idx asc
+  const sorted = flags.slice().sort(function(a,b){
+    if (a.asset !== b.asset) return a.asset.localeCompare(b.asset);
+    return a.i - b.i;
+  });
+  const events = [];
+  let current = null;
+  for (const f of sorted) {
+    if (!current || current.asset !== f.asset || (f.i - current.maxI) > windowMonths) {
+      if (current) events.push(current);
+      current = {
+        asset: f.asset,
+        minI: f.i, maxI: f.i,
+        minPeriod: DATA.master_periods[f.i],
+        maxPeriod: DATA.master_periods[f.i],
+        flags: [f],
+      };
+    } else {
+      current.flags.push(f);
+      current.maxI = Math.max(current.maxI, f.i);
+      current.maxPeriod = DATA.master_periods[current.maxI];
+    }
+  }
+  if (current) events.push(current);
+  return events;
+}
+
+// Synthesize a short root-cause narrative for a composite event.
+function synthesizeEventNarrative(event) {
+  const byCat = {margin: [], cost: [], commodity: []};
+  for (const f of event.flags) {
+    byCat[f.metric.cat].push(f);
+  }
+  const hasMargin = byCat.margin.length > 0;
+  const hasCost = byCat.cost.length > 0;
+  const hasComm = byCat.commodity.length > 0;
+
+  // Collect tags to characterize persistence profile
+  const tagCounts = {};
+  for (const f of event.flags) tagCounts[f.tag] = (tagCounts[f.tag] || 0) + 1;
+  const dominantTag = Object.keys(tagCounts).sort(function(a,b){ return tagCounts[b] - tagCounts[a]; })[0];
+
+  const periodText = event.minI === event.maxI ? event.minPeriod
+                                                : (event.minPeriod + " – " + event.maxPeriod);
+  let headline;
+  if (hasMargin && hasCost && !hasComm) {
+    headline = event.asset + " — Cost-driven margin hit";
+  } else if (hasMargin && hasComm && !hasCost) {
+    headline = event.asset + " — Commodity realization hit margin";
+  } else if (hasMargin && hasCost && hasComm) {
+    headline = event.asset + " — Combined cost + commodity pressure on margin";
+  } else if (hasCost && !hasMargin) {
+    headline = event.asset + " — Multi-bucket cost expansion";
+  } else if (hasComm && !hasMargin) {
+    headline = event.asset + " — Benchmark realization shift";
+  } else if (hasMargin && !hasCost && !hasComm) {
+    headline = event.asset + " — Margin move (mixed drivers)";
+  } else {
+    headline = event.asset + " — " + event.flags.length + " related flags";
+  }
+
+  // Build takeaway text based on tags + category mix
+  let takeaway = "";
+  if (dominantTag === "CAMPAIGN" && hasCost) {
+    takeaway = "Consistent with a planned operational campaign (workover, remediation, facility upgrade). Costs elevated over 2-3 months then recede. Verify scope + expected duration with operations.";
+  } else if (dominantTag === "STRUCTURAL") {
+    takeaway = "Step change persists without reversal — investigate vendor contract resets, scope expansion, or permanent operational shifts. Likely NOT a timing artifact.";
+  } else if (dominantTag === "TIMING") {
+    takeaway = "One-month deviation — most likely accrual timing, credit memo, or late invoice. Check for self-correction next month.";
+  } else if (dominantTag === "IMPROVEMENT") {
+    takeaway = "Persistent favorable move — capture the driver (vendor renegotiation, scope reduction, operational efficiency) so the gain can be extended.";
+  }
+
+  // Also find top 2-3 specific drivers from the flags
+  const drivers = event.flags.slice()
+    .sort(function(a,b){ return b.sigmas - a.sigmas; })
+    .slice(0, 3)
+    .map(function(f){
+      const dir = f.dev > 0 ? "↑" : "↓";
+      return f.metric.label + " " + dir + " (σ=" + f.sigmas.toFixed(1) + ")";
+    })
+    .join(" · ");
+
+  return {
+    headline: headline,
+    periodText: periodText,
+    dominantTag: dominantTag,
+    takeaway: takeaway,
+    driversList: drivers,
+    tagCounts: tagCounts,
+  };
+}
+
 function generateNarrative(flag) {
   const m = flag.metric;
   const asset = flag.asset;
@@ -2147,6 +2273,29 @@ function renderInsights() {
     catCtrl.appendChild(lbl);
   });
   flex.appendChild(catCtrl);
+  // Grouped vs flat toggle
+  flex.appendChild(el("label",{cls:"dim",text:"View:"}));
+  const viewToggle = el("div",{style:"display:inline-flex; gap:2px; background:var(--panel2); padding:3px; border-radius:5px; border:1px solid var(--border);"});
+  const viewBtn = function(val, label, active){
+    const b = el("button",{attrs:{"data-view":val},style:"background:"+(active?"var(--panel)":"transparent")+"; color:"+(active?"var(--text)":"var(--text-dim)")+"; border:none; padding:5px 12px; border-radius:3px; cursor:pointer; font-size:12px; font-family:inherit; font-weight:500;"});
+    b.textContent = label; return b;
+  };
+  const btnGrouped = viewBtn("grouped","Grouped Events",true);
+  const btnFlat    = viewBtn("flat","Flat List",false);
+  viewToggle.appendChild(btnGrouped);
+  viewToggle.appendChild(btnFlat);
+  flex.appendChild(viewToggle);
+  let viewMode = "grouped";
+  const setView = function(v){
+    viewMode = v;
+    btnGrouped.style.background = v==="grouped" ? "var(--panel)" : "transparent";
+    btnGrouped.style.color      = v==="grouped" ? "var(--text)" : "var(--text-dim)";
+    btnFlat.style.background    = v==="flat" ? "var(--panel)" : "transparent";
+    btnFlat.style.color         = v==="flat" ? "var(--text)" : "var(--text-dim)";
+  };
+  btnGrouped.addEventListener("click", function(){ setView("grouped"); build(); });
+  btnFlat.addEventListener("click", function(){ setView("flat"); build(); });
+
   root.appendChild(flex);
 
   const banner = el("div",{id:"ins-banner",cls:"dim",style:"font-size:12px; margin-bottom:12px;"});
@@ -2176,14 +2325,24 @@ function renderInsights() {
     const threshold = +slider.value;
 
     const allFlags = [];
+    // Precompute stub masks per asset — exclude months with zero activity that
+    // occur after the asset started producing (handles Feb-26 reporting-lag stubs).
+    const stubMasks = {};
     for (const asset of selectedAssets) {
       const im = DATA.insight_metrics[asset];
       if (!im) continue;
+      stubMasks[asset] = buildStubMask(im.ActiveWells || [], im.BOE || []);
+    }
+
+    for (const asset of selectedAssets) {
+      const im = DATA.insight_metrics[asset];
+      if (!im) continue;
+      const stubMask = stubMasks[asset] || [];
       for (const metric of INSIGHT_METRICS) {
         if (selectedCats.indexOf(metric.cat) < 0) continue;
         const series = im[metric.id];
         if (!series) continue;
-        const flags = detectAnomalies(series, {threshold: threshold, minWarmup: 6});
+        const flags = detectAnomalies(series, {threshold: threshold, minWarmup: 6, stubMask: stubMask});
         flags.forEach(function(f){
           const tag = classifyPersistence(series, f.i, f.dev, metric.up);
           allFlags.push(Object.assign({}, f, {
@@ -2193,17 +2352,226 @@ function renderInsights() {
         });
       }
     }
+    // Sort order per user spec:
+    //   Asset alphabetic, then Persistence in order (Improvement, Structural, Campaign, Timing),
+    //   then newest period first, then severity desc.
+    const persistenceRank = {IMPROVEMENT: 0, STRUCTURAL: 1, CAMPAIGN: 2, TIMING: 3};
     allFlags.sort(function(a,b){
+      if (a.asset !== b.asset) return a.asset.localeCompare(b.asset);
+      const ra = persistenceRank[a.tag] !== undefined ? persistenceRank[a.tag] : 99;
+      const rb = persistenceRank[b.tag] !== undefined ? persistenceRank[b.tag] : 99;
+      if (ra !== rb) return ra - rb;
       if (b.i !== a.i) return b.i - a.i;
       return b.sigmas - a.sigmas;
     });
 
     banner.textContent = allFlags.length + " anomaly flags across " + selectedAssets.length + " asset(s) at σ ≥ " + threshold.toFixed(1);
 
+    // --- Build single-flag card (extracted so grouped and flat modes both use it) ---
+    const buildFlagCard = function(f){
+      const severity = f.sigmas > 2.5 ? "high" : (f.sigmas < 1.8 ? "low" : "");
+      const card = el("div",{cls:"ins-flag " + severity});
+
+      const hdr = el("div",{cls:"ins-flag-header"});
+      hdr.appendChild(el("span",{cls:"ins-flag-metric",text:f.asset + " — " + f.metric.label}));
+      hdr.appendChild(el("span",{cls:"dim",style:"font-size:12px;",text:f.period}));
+      hdr.appendChild(el("span",{cls:"tag " + f.tag.toLowerCase(), text:f.tag}));
+      hdr.appendChild(el("span",{cls:"dim",style:"font-size:11px;",text:"σ=" + f.sigmas.toFixed(1)}));
+      card.appendChild(hdr);
+
+      const narr = generateNarrative(f);
+      const narrWrap = el("div",{cls:"ins-flag-detail",style:"line-height:1.6;"});
+      narrWrap.appendChild(el("div",{style:"color:var(--text);margin-bottom:4px;",text:narr.lead}));
+      if (narr.persistence) narrWrap.appendChild(el("div",{style:"color:var(--text-dim);font-style:italic;margin-bottom:4px;",text:narr.persistence}));
+      if (narr.driver)      narrWrap.appendChild(el("div",{style:"color:var(--text-dim);",text:narr.driver}));
+      card.appendChild(narrWrap);
+
+      const series = DATA.insight_metrics[f.asset][f.metric.id];
+      const anomalyIdx = detectAnomalies(series, {threshold: threshold, stubMask: stubMasks[f.asset] || []}).map(function(x){ return x.i; });
+      const spkWrap = el("div",{style:"margin-top:8px;"});
+      spkWrap.appendChild(buildSparkline(series, anomalyIdx, {width: 500, height: 44}));
+      card.appendChild(spkWrap);
+
+      const isMarginFlag = (f.metric.id === "EBITDA_Margin" || f.metric.id === "FCF_Margin");
+      if (isMarginFlag) {
+        const btnRow = el("div",{style:"margin-top:8px;"});
+        const btn = el("button",{cls:"ins-decompose-btn",text:"▸ Variance decomposition"});
+        btnRow.appendChild(btn);
+        card.appendChild(btnRow);
+        const decomp = el("div",{cls:"ins-decompose"});
+        card.appendChild(decomp);
+        btn.addEventListener("click", function(){
+          const isOpen = decomp.classList.toggle("open");
+          btn.textContent = (isOpen ? "▾" : "▸") + " Variance decomposition";
+          if (isOpen && !decomp.dataset.filled) {
+            const parts = f.period.split("-");
+            const mname = parts[0], yy = parts[1];
+            const mMap = {Jan:1,Feb:2,Mar:3,Apr:4,May:5,Jun:6,Jul:7,Aug:8,Sep:9,Oct:10,Nov:11,Dec:12};
+            const year = 2000 + parseInt(yy);
+            const month = mMap[mname];
+            clear(decomp);
+            const d = decomposeMarginChange(f.asset, year, month);
+            if (d) {
+              decomp.appendChild(el("div",{style:"font-weight:600; color:var(--text); margin-bottom:6px;",
+                text:"Contribution to margin change vs prior 3-mo avg (pp of baseline revenue):"}));
+              const grp = el("div",{style:"display:flex; gap:12px; margin-bottom:8px; font-size:11px;"});
+              ["revenue","deducts","cost"].forEach(function(g){
+                const chip = el("div",{style:"background:var(--panel); padding:4px 10px; border-radius:3px; border:1px solid var(--border);"});
+                const pp = d.byGroup[g];
+                const sign = pp > 0 ? "+" : "";
+                const color = pp > 0 ? "#7ed1a8" : (pp < 0 ? "#ff7676" : "var(--text-dim)");
+                chip.appendChild(el("span",{cls:"dim",style:"margin-right:6px;",text:g + ":"}));
+                chip.appendChild(el("span",{style:"color:" + color + "; font-weight:600;", text: sign + pp.toFixed(1) + "pp"}));
+                grp.appendChild(chip);
+              });
+              decomp.appendChild(grp);
+              d.components.forEach(function(c){
+                if (Math.abs(c.pp) < 0.2) return;
+                const row = el("div",{style:"display:flex; justify-content:space-between; padding:3px 0; font-size:12px;"});
+                row.appendChild(el("span",{text:c.name + " (" + c.group + ")"}));
+                const sgn = c.pp > 0 ? "+" : "";
+                const col = c.pp > 0 ? "#7ed1a8" : "#ff7676";
+                const right = el("span",{style:"color:" + col + ";"});
+                right.appendChild(document.createTextNode(sgn + c.pp.toFixed(1) + "pp"));
+                right.appendChild(el("span",{cls:"dim",style:"margin-left:8px; font-variant-numeric:tabular-nums;",text:"(" + (c.dollar>0?"+":"") + fmtMoney(c.dollar) + ")"}));
+                row.appendChild(right);
+                decomp.appendChild(row);
+              });
+            } else {
+              decomp.textContent = "Decomposition not available (missing baseline months).";
+            }
+            decomp.dataset.filled = "1";
+          }
+        });
+      }
+
+      const isCostFlag = (f.metric.id === "Var_per_BOE" || f.metric.id === "Fixed_per_Wellmo" ||
+                          f.metric.id === "Workover_per_Wellmo" ||
+                          f.metric.id === "Field_Personnel_per_Well");
+      if (isCostFlag) {
+        const btnRow = el("div",{style:"margin-top:8px;"});
+        const btn = el("button",{cls:"ins-decompose-btn",text:"▸ Drill sub-buckets"});
+        btnRow.appendChild(btn);
+        card.appendChild(btnRow);
+        const decomp = el("div",{cls:"ins-decompose"});
+        card.appendChild(decomp);
+        btn.addEventListener("click", function(){
+          const isOpen = decomp.classList.toggle("open");
+          btn.textContent = (isOpen ? "▾" : "▸") + " Drill sub-buckets";
+          if (isOpen && !decomp.dataset.filled) {
+            const parts = f.period.split("-");
+            const mname = parts[0], yy = parts[1];
+            const mMap = {Jan:1,Feb:2,Mar:3,Apr:4,May:5,Jun:6,Jul:7,Aug:8,Sep:9,Oct:10,Nov:11,Dec:12};
+            const year = 2000 + parseInt(yy);
+            const month = mMap[mname];
+            const bucket = f.metric.id === "Var_per_BOE" ? "VAR_OPEX" :
+                           f.metric.id === "Fixed_per_Wellmo" ? "FIX_OPEX" :
+                           f.metric.id === "Workover_per_Wellmo" ? "WORKOVER" :
+                           f.metric.id === "Field_Personnel_per_Well" ? "FIX_OPEX" : null;
+            clear(decomp);
+            if (bucket) {
+              const drill = costDrillDown(f.asset, year, month, bucket);
+              if (drill && drill.length) {
+                const title = el("div",{style:"font-weight:600; color:var(--text); margin-bottom:6px;",text:"Top sub-category changes vs prior 3-mo avg:"});
+                decomp.appendChild(title);
+                drill.forEach(function(d){
+                  const row = el("div",{style:"display:flex; justify-content:space-between; padding:3px 0;"});
+                  row.appendChild(el("span",{text:d.sub}));
+                  const sign = d.delta > 0 ? "+" : "";
+                  const amt = el("span",{style:"color:" + (d.delta>0?"#ff7676":"#7ed1a8") + ";", text: sign + fmtMoneyFull(d.delta)});
+                  row.appendChild(amt);
+                  decomp.appendChild(row);
+                });
+              } else {
+                decomp.textContent = "Sub-bucket data not available for this period.";
+              }
+              decomp.dataset.filled = "1";
+            }
+          }
+        });
+      }
+      return card;
+    };
+
     clear(flagsWrap);
     if (allFlags.length === 0) {
       flagsWrap.appendChild(el("div",{cls:"dim",style:"padding:16px; text-align:center;",text:"No anomalies at current threshold. Try lowering σ or adding more asset/category filters."}));
     }
+
+    if (viewMode === "grouped") {
+      // Group flags into composite events and render synthesis + nested individual flags
+      const events = groupFlagsIntoEvents(allFlags, 1);
+      // Re-sort events: Asset alpha, then tag rank of dominant tag, then newest maxI first
+      const persistenceRankEvt = {IMPROVEMENT: 0, STRUCTURAL: 1, CAMPAIGN: 2, TIMING: 3};
+      const eventsSorted = events.map(function(e){
+        const s = synthesizeEventNarrative(e);
+        return Object.assign({}, e, {synth: s});
+      }).sort(function(a,b){
+        if (a.asset !== b.asset) return a.asset.localeCompare(b.asset);
+        const ra = persistenceRankEvt[a.synth.dominantTag] !== undefined ? persistenceRankEvt[a.synth.dominantTag] : 99;
+        const rb = persistenceRankEvt[b.synth.dominantTag] !== undefined ? persistenceRankEvt[b.synth.dominantTag] : 99;
+        if (ra !== rb) return ra - rb;
+        return b.maxI - a.maxI;
+      });
+
+      for (const evt of eventsSorted) {
+        if (evt.flags.length === 1) {
+          // Single flag — render the flag card directly (no wrapping event shell)
+          flagsWrap.appendChild(buildFlagCard(evt.flags[0]));
+          continue;
+        }
+        // Composite event card
+        const evtWrap = el("div",{style:"border:1px solid var(--accent); border-radius:6px; margin-bottom:14px; padding:14px; background:var(--panel2);"});
+        const evtHdr = el("div",{style:"display:flex; gap:10px; align-items:center; flex-wrap:wrap; margin-bottom:8px;"});
+        evtHdr.appendChild(el("span",{style:"font-weight:700; font-size:14px; color:var(--text);", text:evt.synth.headline}));
+        evtHdr.appendChild(el("span",{cls:"dim",style:"font-size:12px;", text:evt.synth.periodText}));
+        evtHdr.appendChild(el("span",{cls:"tag " + evt.synth.dominantTag.toLowerCase(), text:evt.synth.dominantTag + " (dominant)"}));
+        evtHdr.appendChild(el("span",{cls:"dim",style:"font-size:11px;", text:evt.flags.length + " related flags"}));
+        evtWrap.appendChild(evtHdr);
+        // Driver summary line
+        if (evt.synth.driversList) {
+          evtWrap.appendChild(el("div",{cls:"dim",style:"font-size:12px; margin-bottom:6px;",text:"Top drivers: " + evt.synth.driversList}));
+        }
+        // Takeaway text
+        if (evt.synth.takeaway) {
+          const tk = el("div",{style:"background:var(--panel); border-left:3px solid var(--accent); padding:8px 12px; border-radius:0 3px 3px 0; font-size:12px; color:var(--text); margin-bottom:10px;"});
+          tk.appendChild(el("span",{style:"font-weight:600; color:var(--accent); margin-right:6px;",text:"Takeaway:"}));
+          tk.appendChild(document.createTextNode(evt.synth.takeaway));
+          evtWrap.appendChild(tk);
+        }
+        // Expandable section listing nested flag cards
+        const expander = el("button",{cls:"ins-decompose-btn",style:"margin-bottom:0;",text:"▸ Show " + evt.flags.length + " underlying flags"});
+        evtWrap.appendChild(expander);
+        const nested = el("div",{style:"display:none; margin-top:12px;"});
+        evtWrap.appendChild(nested);
+        expander.addEventListener("click", function(){
+          const isOpen = nested.style.display !== "none";
+          nested.style.display = isOpen ? "none" : "block";
+          expander.textContent = (isOpen ? "▸" : "▾") + " Show " + evt.flags.length + " underlying flags";
+          if (!isOpen && !nested.dataset.filled) {
+            // Within-event sort: persistence rank, newest first
+            const sortedFlags = evt.flags.slice().sort(function(a,b){
+              const ra = persistenceRankEvt[a.tag] !== undefined ? persistenceRankEvt[a.tag] : 99;
+              const rb = persistenceRankEvt[b.tag] !== undefined ? persistenceRankEvt[b.tag] : 99;
+              if (ra !== rb) return ra - rb;
+              return b.i - a.i;
+            });
+            for (const f of sortedFlags) {
+              nested.appendChild(buildFlagCard(f));
+            }
+            nested.dataset.filled = "1";
+          }
+        });
+        flagsWrap.appendChild(evtWrap);
+      }
+    } else {
+      // Flat mode — render each flag independently in user's sort order
+      for (const f of allFlags) {
+        flagsWrap.appendChild(buildFlagCard(f));
+      }
+    }
+    // Skip legacy per-flag rendering loop below
+    if (false) {
     for (const f of allFlags) {
       const severity = f.sigmas > 2.5 ? "high" : (f.sigmas < 1.8 ? "low" : "");
       const card = el("div",{cls:"ins-flag " + severity});
@@ -2224,7 +2592,7 @@ function renderInsights() {
       card.appendChild(narrWrap);
 
       const series = DATA.insight_metrics[f.asset][f.metric.id];
-      const anomalyIdx = detectAnomalies(series, {threshold: threshold}).map(function(x){ return x.i; });
+      const anomalyIdx = detectAnomalies(series, {threshold: threshold, stubMask: stubMasks[f.asset] || []}).map(function(x){ return x.i; });
       const spkWrap = el("div",{style:"margin-top:8px;"});
       spkWrap.appendChild(buildSparkline(series, anomalyIdx, {width: 500, height: 44}));
       card.appendChild(spkWrap);
@@ -2332,6 +2700,7 @@ function renderInsights() {
       }
       flagsWrap.appendChild(card);
     }
+    } // end if (false) — legacy per-flag rendering (replaced by buildFlagCard + grouped/flat)
 
     // Field Personnel consistency panel — click any row to drill into well-level breakdown
     clear(fpPanel);
@@ -2444,12 +2813,13 @@ function renderInsights() {
     for (const asset of selectedAssets) {
       const im = DATA.insight_metrics[asset];
       if (!im) continue;
+      const stubMask = stubMasks[asset] || [];
       for (const metric of INSIGHT_METRICS) {
         if (selectedCats.indexOf(metric.cat) < 0) continue;
         const series = im[metric.id];
         if (!series) continue;
         const latest = series[series.length-2];
-        const flags = detectAnomalies(series, {threshold: threshold});
+        const flags = detectAnomalies(series, {threshold: threshold, stubMask: stubMask});
         const card = el("div",{cls:"ins-spark-card"});
         const hdr = el("div",{style:"display:flex; justify-content:space-between; align-items:center; margin-bottom:4px;"});
         hdr.appendChild(el("span",{cls:"ins-spark-label",text:asset + " · " + metric.label}));
