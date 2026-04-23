@@ -91,6 +91,17 @@
                          background: #141416; z-index: 20;
                          box-shadow: 0 1px 0 var(--border); }
 
+  /* Section headers (VOLUMES, GROSS REVENUE, etc.) stick just below the thead.
+     --mlos-section-top is measured from thead.offsetHeight at render time. */
+  #mlos-table tr.mlos-section-hdr td {
+    position: sticky;
+    top: var(--mlos-section-top, 34px);
+    left: 0;
+    background: #1c1c20 !important;
+    z-index: 15;
+    box-shadow: 0 1px 0 var(--border);
+  }
+
   /* First column (line-item labels) sticks to left of the panel's scroll viewport.
      Panel has no padding, so first-col's left:0 is flush with the panel edge — no
      gap for cells to bleed through. Explicit opaque background + z-index hierarchy. */
@@ -140,7 +151,6 @@
   <button data-tab="monthly">Monthly LOS Table</button>
   <button data-tab="scaling">Scaling Factors</button>
   <button data-tab="joint">Joint Wells</button>
-  <button data-tab="buckets">Bucket Detail</button>
   <button data-tab="exceptions">Exceptions</button>
   <button data-tab="methodology">Methodology</button>
 </nav>
@@ -152,7 +162,6 @@
 <div id="tab-monthly" class="tab-content"></div>
 <div id="tab-scaling" class="tab-content"></div>
 <div id="tab-joint" class="tab-content"></div>
-<div id="tab-buckets" class="tab-content"></div>
 <div id="tab-exceptions" class="tab-content"></div>
 <div id="tab-methodology" class="tab-content"></div>
 
@@ -334,14 +343,12 @@ function renderSummary() {
   clear(root);
 
   root.appendChild(el("h2", {text:"2025 Headline - Net vs Gross"}));
-  root.appendChild(el("div", {cls:"subtitle", style:"margin-bottom:8px;", text:"Same LOS data viewed two ways: what Peak 10 received/paid (Net), and the full Gross LOS - costs scaled by 1/WI, volumes and revenue by 1/NRI (per-well). Ad val is normalized to active-months basis in all views."}));
-  const actRow = el("div",{style:"margin-bottom:14px;"});
-  buildActivityFilter(actRow, 2025);
-  actRow.appendChild(el("span",{cls:"dim",style:"font-size:11px; margin-left:10px;",text:"Fixed $/Well-Mo and Workover $/Well-Mo use wells at or above the threshold. All other metrics unchanged."}));
-  root.appendChild(actRow);
+  root.appendChild(el("div", {cls:"subtitle", style:"margin-bottom:14px;", text:"Same LOS data viewed two ways: what Peak 10 received/paid (Net), and the full Gross LOS - costs scaled by 1/WI, volumes and revenue by 1/NRI (per-well). Ad val is normalized to active-months basis in all views."}));
 
   const bases = ["Net","Gross"];
   const grid = el("div", {cls:"grid-2"});
+  // Days factor: 2025 = 12 months of production for most assets. Use days elapsed
+  // within active months for this asset (we have Active_Months in annual record).
   for (const b of bases) {
     const r = getAnnual("Consolidated", 2025, b);
     if (!r) continue;
@@ -358,17 +365,20 @@ function renderSummary() {
       d.appendChild(el("div",{cls:"kpi-value",text:val}));
       g.appendChild(d);
     };
+    const days = (r.Active_Months || 12) * 30.4375;
+    const boePerDay = days ? r.BOE / days : 0;
+    const totalOpexCapex = (r.Var_Opex || 0) + (r.Fixed_Opex || 0) + (r.Workover || 0) + (r.Total_Capex || 0);
+    const opIncome = r.Net_Revenue - (r.Var_Opex + r.Fixed_Opex + r.Workover); // same as Cash_Op_Margin
+    const fcf = opIncome - r.Total_Capex;
+    const ebitdaMargin = r.Gross_Revenue ? opIncome / r.Gross_Revenue : 0;
     addKpi("Revenue", fmtMoney(r.Gross_Revenue));
-    addKpi("BOE", fmtNum(r.BOE));
+    addKpi("BOE/d (avg)", fmtNum(boePerDay));
     addKpi("Realized $/BOE", fmtMoney2(r.Realized_per_BOE));
     addKpi("Total Cash LOE $/BOE", fmtMoney2(r.Total_Cash_per_BOE));
-    const filt = getFilteredAnnual("Consolidated", 2025, b);
-    const fixV = filt ? filt.Fixed_per_Wellmo : r.Fixed_per_Wellmo;
-    const woV  = filt ? filt.Workover_per_Wellmo : r.Workover_per_Wellmo;
-    addKpi("Fixed $/Well-Mo", fmtMoney(fixV));
-    addKpi("Var $/BOE", fmtMoney2(r.Var_per_BOE));
-    addKpi("Workover $/Well-Mo", fmtMoney(woV));
-    addKpi("Capex", fmtMoney(r.Total_Capex));
+    addKpi("Opex + WO + Capex", fmtMoney(totalOpexCapex));
+    addKpi("Operating Income", fmtMoney(opIncome));
+    addKpi("Free Cash Flow", fmtMoney(fcf));
+    addKpi("EBITDA Margin", fmtPct(ebitdaMargin));
     p.appendChild(g);
     grid.appendChild(p);
   }
@@ -388,15 +398,16 @@ function renderSummary() {
       d.appendChild(el("div",{cls:"kpi-value",text:val}));
       g.appendChild(d);
     };
+    const daysA = (r.Active_Months || 12) * 30.4375;
+    const boedA = daysA ? r.BOE / daysA : 0;
+    const ebitdaA = r.Net_Revenue - (r.Var_Opex + r.Fixed_Opex + r.Workover);
+    const marginA = r.Gross_Revenue ? ebitdaA / r.Gross_Revenue : 0;
     add("Wells (avg)", r.Avg_Active_Wells.toFixed(1));
-    add("BOE", fmtNum(r.BOE));
+    add("BOE/d (avg)", fmtNum(boedA));
     add("Revenue", fmtMoney(r.Gross_Revenue));
-    const filtA = getFilteredAnnual(a, 2025, "Net");
-    const fixA = filtA ? filtA.Fixed_per_Wellmo : r.Fixed_per_Wellmo;
-    const woA  = filtA ? filtA.Workover_per_Wellmo : r.Workover_per_Wellmo;
-    add("Fixed $/Well-Mo", fmtMoney(fixA));
+    add("Cash LOE $/BOE", fmtMoney2(r.Total_Cash_per_BOE));
     add("Var $/BOE", fmtMoney2(r.Var_per_BOE));
-    add("Workover $/Well-Mo", fmtMoney(woA));
+    add("EBITDA Margin", fmtPct(marginA));
     p.appendChild(g);
     g4.appendChild(p);
   }
@@ -459,131 +470,256 @@ onActivityChange(function(){
 function renderTrends() {
   const root = document.getElementById("tab-trends");
   clear(root);
-  const assets = ["Consolidated","Hawkeye","Strawn","Reeves","Genesis"];
-  const metrics = [
-    {id:"BOE",label:"BOE",fmt:"num"},
-    {id:"Gross_Revenue",label:"Gross Revenue",fmt:"money"},
-    {id:"FIX_OPEX",label:"Fixed Opex ($)",fmt:"money"},
-    {id:"VAR_OPEX",label:"Variable Opex ($)",fmt:"money"},
-    {id:"WORKOVER",label:"Workover ($)",fmt:"money"},
-    {id:"Total_Capex",label:"Total Capex ($)",fmt:"money"},
-    {id:"Fixed_per_Well",label:"Fixed $/Well-Mo",fmt:"money"},
-    {id:"Var_per_BOE",label:"Variable $/BOE",fmt:"money2"},
-    {id:"Workover_per_Well",label:"Workover $/Well-Mo",fmt:"money"},
-    {id:"Total_CashOpex_per_BOE",label:"Total Cash Opex $/BOE",fmt:"money2"},
-    {id:"Realized_per_BOE",label:"Realized $/BOE",fmt:"money2"},
-    {id:"ActiveWells",label:"Active Wells",fmt:"num"},
-  ];
+  const ASSETS_NO_CONSOL = ["Hawkeye","Strawn","Reeves","Genesis"];
 
+  // ---- Asset filter (applies to ALL charts on this tab) ----
   const flex = el("div",{cls:"flex"});
-  flex.appendChild(el("label",{cls:"dim",text:"Asset:"}));
-  const saAsset = el("select",{id:"trend-asset"});
-  assets.forEach(function(a){ const o=el("option",{text:a,attrs:{value:a}}); saAsset.appendChild(o); });
-  flex.appendChild(saAsset);
+  flex.appendChild(el("label",{cls:"dim",text:"Assets:"}));
+  const assetCtrl = el("div",{style:"display:flex; gap:6px; flex-wrap:wrap;"});
+  ASSETS_NO_CONSOL.forEach(function(a){
+    const lbl = el("label",{style:"display:inline-flex; align-items:center; gap:5px; background:var(--panel2); border:1px solid var(--border); border-radius:4px; padding:4px 9px; cursor:pointer;"});
+    const cb = el("input",{attrs:{type:"checkbox","data-asset":a}});
+    cb.checked = true;
+    lbl.appendChild(cb);
+    lbl.appendChild(el("span",{cls:"asset-"+a.toLowerCase(),style:"font-weight:600;",text:a}));
+    assetCtrl.appendChild(lbl);
+  });
+  flex.appendChild(assetCtrl);
   flex.appendChild(el("label",{cls:"dim",text:"Basis:"}));
   const saBasis = el("select",{id:"trend-basis"});
   [["Net","Net (Peak 10)"],["Gross","Gross LOS"]].forEach(function(pair){
     const o=el("option",{text:pair[1],attrs:{value:pair[0]}}); saBasis.appendChild(o);
   });
   flex.appendChild(saBasis);
-  flex.appendChild(el("label",{cls:"dim",text:"Metric:"}));
-  const saMetric = el("select",{id:"trend-metric"});
-  metrics.forEach(function(m){ const o=el("option",{text:m.label,attrs:{value:m.id}}); o.setAttribute("data-fmt",m.fmt); saMetric.appendChild(o); });
-  flex.appendChild(saMetric);
   root.appendChild(flex);
+  root.appendChild(el("div",{cls:"dim",style:"font-size:11px; margin-bottom:8px;",text:"Tip: click legend items to toggle; double-click to isolate a single series."}));
 
+  // ---- Chart 1: BOE/d over time (line chart by asset, from monthly series) ----
+  root.appendChild(el("h2",{text:"BOE/d — Monthly Trend"}));
   const p1 = el("div",{cls:"panel"});
-  p1.appendChild(el("canvas",{id:"chart-trend",cls:"chart-wrap tall"}));
+  p1.appendChild(el("canvas",{id:"chart-boed",cls:"chart-wrap tall"}));
   root.appendChild(p1);
 
-  root.appendChild(el("div",{cls:"dim",style:"font-size:11px; margin-top:6px; margin-bottom:8px;",text:"Tip: click legend items to toggle individual series; double-click to isolate one series (or restore all)."}));
-  root.appendChild(el("h2",{text:"Revenue + Cost Stack - Consolidated, Net Basis"}));
+  // ---- Chart 2: Revenue + Cost Stack (kept) ----
+  root.appendChild(el("h2",{text:"Revenue + Cost Stack — Monthly (Net basis)"}));
   const p2 = el("div",{cls:"panel"});
   p2.appendChild(el("canvas",{id:"chart-stack",cls:"chart-wrap tall"}));
   root.appendChild(p2);
 
-  root.appendChild(el("h2",{text:"Active Wells Over Time (all 4 assets, Net basis)"}));
+  // ---- Chart 3: EBITDA margin — quarterly bar by asset ----
+  root.appendChild(el("h2",{text:"EBITDA Margin — Quarterly by Asset"}));
   const p3 = el("div",{cls:"panel"});
-  p3.appendChild(el("canvas",{id:"chart-wells",cls:"chart-wrap"}));
+  p3.appendChild(el("canvas",{id:"chart-ebitda",cls:"chart-wrap tall"}));
   root.appendChild(p3);
 
-  let chartTrend = null;
-  const renderTrendChart = function() {
-    const asset = document.getElementById("trend-asset").value;
+  // ---- Chart 4: FCF margin — quarterly bar by asset ----
+  root.appendChild(el("h2",{text:"FCF Margin — Quarterly by Asset"}));
+  const p4 = el("div",{cls:"panel"});
+  p4.appendChild(el("canvas",{id:"chart-fcf",cls:"chart-wrap tall"}));
+  root.appendChild(p4);
+
+  // ---- Chart 5: Total Cash Cost $/BOE — quarterly by asset (added per "other metrics") ----
+  root.appendChild(el("h2",{text:"Total Cash Cost $/BOE — Quarterly by Asset"}));
+  const p5 = el("div",{cls:"panel"});
+  p5.appendChild(el("canvas",{id:"chart-cashcost",cls:"chart-wrap tall"}));
+  root.appendChild(p5);
+
+  // ---- Chart 6: Capex — quarterly by asset ----
+  root.appendChild(el("h2",{text:"Capex — Quarterly by Asset"}));
+  const p6 = el("div",{cls:"panel"});
+  p6.appendChild(el("canvas",{id:"chart-capex",cls:"chart-wrap tall"}));
+  root.appendChild(p6);
+
+  // ---------- Helpers for quarterly aggregation ----------
+  const getSelectedAssets = function() {
+    const out = [];
+    assetCtrl.querySelectorAll("input[data-asset]").forEach(function(cb){
+      if (cb.checked) out.push(cb.getAttribute("data-asset"));
+    });
+    return out;
+  };
+
+  // Build quarterly aggregates per asset from monthly_table for given basis.
+  // Returns { labels: ["Q4-23","Q1-24",...], byAsset: { Hawkeye: { Revenue:[], Cash:[], Capex:[], EBITDA:[], FCF:[], BOE:[], Months:[] } , ... } }
+  const buildQuarterly = function(basis) {
+    const rowsForBasis = DATA.monthly_table.filter(function(r){ return r.Basis === basis; });
+    const qMap = {};
+    for (const r of rowsForBasis) {
+      const q = Math.ceil(r.Month / 3);
+      const qkey = r.Year + "-Q" + q;
+      if (!qMap[qkey]) qMap[qkey] = {};
+      if (!qMap[qkey][r.Asset]) qMap[qkey][r.Asset] = {
+        Revenue:0, Cash:0, Capex:0, EBITDA:0, BOE:0, Months:0,
+        Var:0, Fix:0, WO:0, Netback:0, Sev:0, Adval:0, NetRev:0,
+      };
+      const a = qMap[qkey][r.Asset];
+      a.Revenue += r.Gross_Revenue;
+      a.Var += r.Var_Opex;
+      a.Fix += r.Fixed_Opex;
+      a.WO  += r.Workover;
+      a.Netback += r.Gas_Netback;
+      a.Sev += r.Severance;
+      a.Adval += r.Adval;
+      a.Capex += r.Total_Capex;
+      a.BOE += r.BOE;
+      if (r.ActiveWells > 0) a.Months += 1;
+    }
+    // Sort labels chronologically
+    const labels = Object.keys(qMap).sort();
+    const byAsset = {};
+    ASSETS_NO_CONSOL.forEach(function(asset){
+      byAsset[asset] = {
+        Revenue:[], Cash:[], Capex:[], EBITDA:[], EBITDA_Margin:[],
+        FCF:[], FCF_Margin:[], BOE:[], BOEd:[], CashPerBOE:[],
+      };
+      for (const qkey of labels) {
+        const a = (qMap[qkey] && qMap[qkey][asset]) || null;
+        if (!a || a.Revenue === 0) {
+          ["Revenue","Cash","Capex","EBITDA","EBITDA_Margin","FCF","FCF_Margin","BOE","BOEd","CashPerBOE"].forEach(function(k){ byAsset[asset][k].push(0); });
+          continue;
+        }
+        const cashOpex = a.Var + a.Fix + a.WO;
+        const netRev = a.Revenue - a.Netback - a.Sev - a.Adval;
+        const ebitda = netRev - cashOpex;
+        const fcf = ebitda - a.Capex;
+        const margin = a.Revenue ? ebitda / a.Revenue : 0;
+        const fcfM = a.Revenue ? fcf / a.Revenue : 0;
+        const days = a.Months * 30.4375 || 1;
+        byAsset[asset].Revenue.push(a.Revenue);
+        byAsset[asset].Cash.push(cashOpex);
+        byAsset[asset].Capex.push(a.Capex);
+        byAsset[asset].EBITDA.push(ebitda);
+        byAsset[asset].EBITDA_Margin.push(margin);
+        byAsset[asset].FCF.push(fcf);
+        byAsset[asset].FCF_Margin.push(fcfM);
+        byAsset[asset].BOE.push(a.BOE);
+        byAsset[asset].BOEd.push(a.BOE / days);
+        byAsset[asset].CashPerBOE.push(a.BOE ? cashOpex / a.BOE : 0);
+      }
+    });
+    // Pretty labels: Q1-24, Q2-24, ...
+    const prettyLabels = labels.map(function(q){
+      const parts = q.split("-Q");
+      return "Q" + parts[1] + "-" + String(parts[0]).slice(2);
+    });
+    return { labels: prettyLabels, byAsset: byAsset, rawLabels: labels };
+  };
+
+  // ---------- Chart renderers (rebuild on any control change) ----------
+  const charts = {};
+  const render = function() {
     const basis = document.getElementById("trend-basis").value;
-    const metricSel = document.getElementById("trend-metric");
-    const metricId = metricSel.value;
-    const fmt = metricSel.options[metricSel.selectedIndex].dataset.fmt;
-    const label = metricSel.options[metricSel.selectedIndex].text;
-    const s = DATA.series[asset];
-    const data = s.bases[basis][metricId];
-    if (chartTrend) chartTrend.destroy();
-    chartTrend = new Chart(document.getElementById("chart-trend"), {
+    const selected = getSelectedAssets();
+    const periods = DATA.series.Consolidated.periods;
+
+    // Chart 1 — BOE/d monthly line chart per selected asset
+    const boedDatasets = selected.map(function(a){
+      // Compute BOE/d from monthly BOE + days in that month; simple = BOE/30.4375
+      const boeArr = DATA.series[a].bases[basis].BOE;
+      const boedArr = boeArr.map(function(b){ return b / 30.4375; });
+      return {
+        label: a, data: boedArr,
+        borderColor: ASSET_COLOR[a], backgroundColor: ASSET_COLOR[a]+"22",
+        borderWidth: 2, pointRadius: 0, pointHoverRadius: 4, tension: 0.25,
+      };
+    });
+    if (charts.boed) charts.boed.destroy();
+    charts.boed = new Chart(document.getElementById("chart-boed"), {
       type:"line",
-      data:{ labels: s.periods,
-        datasets:[{
-          label: asset + " " + BASIS_LABEL[basis] + " - " + label,
-          data: data,
-          borderColor: ASSET_COLOR[asset] || "#e8e8ea",
-          backgroundColor: (ASSET_COLOR[asset] || "#e8e8ea")+"22",
-          borderWidth: 2, pointRadius:0, pointHoverRadius:5, tension:0.2, fill:true,
-        }],
-      },
+      data:{ labels: periods, datasets: boedDatasets },
       options:{ responsive:true, maintainAspectRatio:false,
-        plugins:{ legend:{display:true, labels:{boxWidth:12}},
-          tooltip:{callbacks:{label: function(c){
-            const v=c.parsed.y;
-            if (fmt==="money") return c.dataset.label+": "+fmtMoneyFull(v);
-            if (fmt==="money2") return c.dataset.label+": "+fmtMoney2(v);
-            return c.dataset.label+": "+fmtNum(v);
-          }}}},
-        scales:{ y:{beginAtZero:true,grid:{color:"#2a2a30"},
-            ticks:{callback:function(v){ return fmt==="money"?fmtMoney(v):(fmt==="money2"?"$"+v.toFixed(2):fmtNum(v)); }}},
-          x:{grid:{display:false},ticks:{maxRotation:45,autoSkip:true,maxTicksLimit:14}}},
+        plugins:{ legend:{position:"top",labels:{boxWidth:12}},
+          tooltip:{callbacks:{label:function(c){ return c.dataset.label+": "+fmtNum(c.parsed.y)+" BOE/d"; }}}},
+        scales:{ y:{beginAtZero:true,grid:{color:"#2a2a30"},ticks:{callback:function(v){return fmtNum(v);}}},
+                 x:{grid:{display:false},ticks:{maxRotation:45,autoSkip:true,maxTicksLimit:14}}},
       },
     });
+
+    // Chart 2 — Revenue + Cost stack (sum across SELECTED assets, same basis)
+    const n = periods.length;
+    const sumArr = function(field){
+      const out = new Array(n).fill(0);
+      for (const a of selected) {
+        const arr = DATA.series[a].bases[basis][field];
+        for (let i=0; i<n; i++) out[i] += arr[i] || 0;
+      }
+      return out;
+    };
+    const rev = sumArr("Gross_Revenue");
+    const fixArr = sumArr("FIX_OPEX");
+    const varArr = sumArr("VAR_OPEX");
+    const woArr = sumArr("WORKOVER");
+    const gnArr = sumArr("GAS_NETBACK");
+    const sevArr = sumArr("SEVERANCE"), advArr = sumArr("ADVAL");
+    if (charts.stack) charts.stack.destroy();
+    charts.stack = new Chart(document.getElementById("chart-stack"), {
+      data:{ labels: periods,
+        datasets:[
+          { type:"line", label:"Revenue", data: rev, backgroundColor:"#7ed1a844", borderColor:"#7ed1a8", borderWidth:2, tension:0.2, pointRadius:0, order:0 },
+          { type:"bar", label:"Fixed Opex", data: fixArr, backgroundColor:"#e87a5dcc", stack:"costs", order:1 },
+          { type:"bar", label:"Variable Opex", data: varArr, backgroundColor:"#ffb347cc", stack:"costs", order:1 },
+          { type:"bar", label:"Workover", data: woArr, backgroundColor:"#b788ffcc", stack:"costs", order:1 },
+          { type:"bar", label:"Gas Netback", data: gnArr, backgroundColor:"#7ab5ff88", stack:"costs", order:1 },
+          { type:"bar", label:"Sev+AdVal", data: sevArr.map(function(v,i){return v+advArr[i];}), backgroundColor:"#5a5a60cc", stack:"costs", order:1 },
+        ],
+      },
+      options:{ responsive:true, maintainAspectRatio:false,
+        plugins:{ legend:{position:"top",labels:{boxWidth:12,padding:10}},
+          tooltip:{callbacks:{label: function(c){ return c.dataset.label+": "+fmtMoneyFull(c.parsed.y); }}}},
+        scales:{ y:{beginAtZero:true,stacked:true,grid:{color:"#2a2a30"},ticks:{callback:function(v){return fmtMoney(v);}}},
+                 x:{stacked:true,grid:{display:false},ticks:{maxRotation:45,autoSkip:true,maxTicksLimit:14}}},
+      },
+    });
+
+    // Charts 3-6 — quarterly bar charts
+    const q = buildQuarterly(basis);
+    const makeBarDatasets = function(metricKey) {
+      return selected.map(function(a){
+        return {
+          label: a,
+          data: q.byAsset[a][metricKey],
+          backgroundColor: ASSET_COLOR[a]+"cc",
+          borderColor: ASSET_COLOR[a],
+          borderWidth: 1,
+        };
+      });
+    };
+    const makeBarChart = function(canvasId, metricKey, valueFmt) {
+      if (charts[canvasId]) charts[canvasId].destroy();
+      charts[canvasId] = new Chart(document.getElementById(canvasId), {
+        type:"bar",
+        data:{ labels: q.labels, datasets: makeBarDatasets(metricKey) },
+        options:{ responsive:true, maintainAspectRatio:false,
+          plugins:{ legend:{position:"top",labels:{boxWidth:12}},
+            tooltip:{callbacks:{label:function(c){
+              const v=c.parsed.y;
+              if (valueFmt==="pct") return c.dataset.label+": "+fmtPct(v);
+              if (valueFmt==="money") return c.dataset.label+": "+fmtMoneyFull(v);
+              if (valueFmt==="money2") return c.dataset.label+": "+fmtMoney2(v);
+              return c.dataset.label+": "+fmtNum(v);
+            }}}},
+          scales:{
+            y:{beginAtZero:false, grid:{color:"#2a2a30"},
+               ticks:{callback:function(v){
+                 if (valueFmt==="pct") return (v*100).toFixed(0)+"%";
+                 if (valueFmt==="money") return fmtMoney(v);
+                 if (valueFmt==="money2") return "$"+v.toFixed(2);
+                 return fmtNum(v);
+               }}},
+            x:{grid:{display:false}},
+          },
+        },
+      });
+    };
+    makeBarChart("chart-ebitda",  "EBITDA_Margin", "pct");
+    makeBarChart("chart-fcf",     "FCF_Margin",    "pct");
+    makeBarChart("chart-cashcost","CashPerBOE",    "money2");
+    makeBarChart("chart-capex",   "Capex",         "money");
   };
-  ["trend-asset","trend-basis","trend-metric"].forEach(function(id){
-    document.getElementById(id).addEventListener("change", renderTrendChart);
-  });
-  renderTrendChart();
 
-  const periods = DATA.series.Consolidated.periods;
-  const s = DATA.series.Consolidated.bases.Net;
-  new Chart(document.getElementById("chart-stack"), {
-    data:{ labels: periods,
-      datasets:[
-        { type:"line", label:"Revenue", data: s.Gross_Revenue, backgroundColor:"#7ed1a844", borderColor:"#7ed1a8", borderWidth:2, tension:0.2, pointRadius:0, order:0, yAxisID:"y" },
-        { type:"bar", label:"Fixed Opex", data: s.FIX_OPEX, backgroundColor:"#e87a5dcc", stack:"costs", order:1 },
-        { type:"bar", label:"Variable Opex", data: s.VAR_OPEX, backgroundColor:"#ffb347cc", stack:"costs", order:1 },
-        { type:"bar", label:"Workover", data: s.WORKOVER, backgroundColor:"#b788ffcc", stack:"costs", order:1 },
-        { type:"bar", label:"Gas Netback", data: s.GAS_NETBACK, backgroundColor:"#7ab5ff88", stack:"costs", order:1 },
-        { type:"bar", label:"Sev+AdVal", data: s.SEVERANCE.map(function(v,i){return v+s.ADVAL[i];}), backgroundColor:"#5a5a60cc", stack:"costs", order:1 },
-      ],
-    },
-    options:{ responsive:true, maintainAspectRatio:false,
-      plugins:{ legend:{position:"top",labels:{boxWidth:12,padding:10}},
-        tooltip:{callbacks:{label: function(c){ return c.dataset.label+": "+fmtMoneyFull(c.parsed.y); }}}},
-      scales:{ y:{beginAtZero:true,stacked:true,grid:{color:"#2a2a30"},ticks:{callback:function(v){return fmtMoney(v);}}},
-               x:{stacked:true,grid:{display:false},ticks:{maxRotation:45,autoSkip:true,maxTicksLimit:14}}},
-    },
-  });
-
-  new Chart(document.getElementById("chart-wells"), {
-    type:"line",
-    data:{ labels: periods,
-      datasets: ["Hawkeye","Strawn","Reeves","Genesis"].map(function(a){ return {
-        label:a, data: DATA.series[a].bases.Net.ActiveWells,
-        borderColor: ASSET_COLOR[a], backgroundColor: ASSET_COLOR[a]+"22",
-        borderWidth:2, pointRadius:0, tension:0.25, fill:false,
-      }; }),
-    },
-    options:{ responsive:true, maintainAspectRatio:false,
-      plugins:{legend:{position:"top",labels:{boxWidth:12}}},
-      scales:{y:{beginAtZero:true,grid:{color:"#2a2a30"}},
-              x:{grid:{display:false},ticks:{maxRotation:45,autoSkip:true,maxTicksLimit:14}}},
-    },
-  });
+  saBasis.addEventListener("change", render);
+  assetCtrl.querySelectorAll("input").forEach(function(cb){ cb.addEventListener("change", render); });
+  render();
 }
 
 function renderAnnual() {
@@ -797,6 +933,14 @@ function renderMonthly() {
     const o = el("option",{text:p[1],attrs:{value:p[0]}}); if (p[0]==="all") o.setAttribute("selected",""); saY.appendChild(o);
   });
   flex.appendChild(saY);
+  flex.appendChild(el("label",{cls:"dim",text:"Period:"}));
+  const saP = el("select",{id:"mlos-period"});
+  [["M","Monthly"],["Q","Quarterly"],["Y","Yearly"]].forEach(function(p){
+    const o = el("option",{text:p[1],attrs:{value:p[0]}});
+    if (p[0]==="M") o.setAttribute("selected","");
+    saP.appendChild(o);
+  });
+  flex.appendChild(saP);
   buildActivityFilter(flex, 2025);
   stickyTop.appendChild(flex);
   root.appendChild(stickyTop);
@@ -852,19 +996,67 @@ function renderMonthly() {
         }
       }
     }
-    const periods = Object.keys(agg).sort().map(function(k){ return agg[k]; });
+    let periods = Object.keys(agg).sort().map(function(k){ return agg[k]; });
+
+    // Period aggregation: group months into quarters or years if selected
+    const periodMode = document.getElementById("mlos-period").value;
+    if (periodMode === "Q" || periodMode === "Y") {
+      const bucketMap = {};
+      for (const p of periods) {
+        let bucketKey, bucketLabel;
+        if (periodMode === "Q") {
+          const q = Math.ceil(p.Month / 3);
+          bucketKey = p.Year + "-Q" + q;
+          bucketLabel = "Q" + q + "-" + String(p.Year).slice(2);
+        } else {
+          bucketKey = String(p.Year);
+          bucketLabel = String(p.Year);
+        }
+        if (!bucketMap[bucketKey]) {
+          bucketMap[bucketKey] = {
+            Year: p.Year, Month: p.Month, Period: bucketLabel,
+            ActiveWells:0, Oil_bbl:0, Gas_mcf:0, NGL_bbl:0, BOE:0,
+            Oil_Revenue:0, Gas_Revenue:0, NGL_Revenue:0, Gross_Revenue:0,
+            Gas_Netback:0, Severance:0, Adval:0,
+            Var_Opex:0, Fixed_Opex:0, Workover:0, Total_Cash_Opex:0,
+            Capex_T:0, Capex_I:0, Capex_U:0, Total_Capex:0,
+            Net_Revenue:0, Cash_Op_Margin:0,
+            subs: {}, _months: []
+          };
+        }
+        const a = bucketMap[bucketKey];
+        a._months.push(p.Month);
+        for (const k of Object.keys(a)) {
+          if (k==="Year"||k==="Month"||k==="Period"||k==="subs"||k==="_months") continue;
+          a[k] += p[k] || 0;
+        }
+        // Deep-merge subs
+        const psubs = p.subs || {};
+        for (const bk in psubs) {
+          if (!a.subs[bk]) a.subs[bk] = {};
+          for (const sc in psubs[bk]) {
+            a.subs[bk][sc] = (a.subs[bk][sc] || 0) + psubs[bk][sc];
+          }
+        }
+      }
+      periods = Object.keys(bucketMap).sort().map(function(k){ return bucketMap[k]; });
+    }
 
     // Activity filter: if threshold > 0, replace per-period Fixed/WO/ActiveWells
     // used ONLY for Fix $/Well-Mo and Workover $/Well-Mo calcs (stored on
     // separate fields so the original totals are preserved for sums).
+    // When aggregating to quarters/years, sum filtered values across ALL months
+    // in the bucket (p._months is populated by the bucket aggregation above).
     const useFilter = ACTIVITY_THRESHOLD > 0;
     for (const p of periods) {
       if (useFilter) {
-        // Sum filtered values across selected assets for this (year, month)
         let fFix = 0, fWO = 0, fWells = 0;
-        for (const a of checked) {
-          const f = getFiltered(basis, a, p.Year, p.Month);
-          if (f) { fFix += f.Fixed; fWO += f.WO; fWells += f.Wells; }
+        const monthList = p._months || [p.Month];
+        for (const m of monthList) {
+          for (const a of checked) {
+            const f = getFiltered(basis, a, p.Year, m);
+            if (f) { fFix += f.Fixed; fWO += f.WO; fWells += f.Wells; }
+          }
         }
         p.FiltFixed = fFix;
         p.FiltWO = fWO;
@@ -1150,10 +1342,18 @@ function renderMonthly() {
     table.appendChild(tbody);
     panel.appendChild(table);
     wrap.appendChild(panel);
+
+    // Measure thead height and feed to section-header sticky top
+    requestAnimationFrame(function(){
+      const thead = table.querySelector("thead");
+      if (thead) {
+        document.documentElement.style.setProperty("--mlos-section-top", thead.offsetHeight + "px");
+      }
+    });
   };
 
   assetCtrl.querySelectorAll("input").forEach(function(cb){ cb.addEventListener("change", build); });
-  ["mlos-basis","mlos-year"].forEach(function(id){ document.getElementById(id).addEventListener("change", build); });
+  ["mlos-basis","mlos-year","mlos-period"].forEach(function(id){ document.getElementById(id).addEventListener("change", build); });
   onActivityChange(build);  // rebuild when global activity threshold changes
   build();
 }
@@ -1459,7 +1659,7 @@ const renderFns = {
   summary: renderSummary, trends: renderTrends, annual: renderAnnual,
   gross: renderGross, monthly: renderMonthly,
   scaling: renderScaling, joint: renderJoint,
-  buckets: renderBuckets, exceptions: renderExceptions, methodology: renderMethodology,
+  exceptions: renderExceptions, methodology: renderMethodology,
 };
 const rendered = {};
 function switchTab(name) {
