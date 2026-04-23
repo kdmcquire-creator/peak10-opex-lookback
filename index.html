@@ -418,10 +418,9 @@ function renderSummary() {
   c1.appendChild(el("canvas",{id:"chart-summary-cashloe",cls:"chart-wrap"}));
   root.appendChild(c1);
 
-  root.appendChild(el("h2",{text:"Fixed Opex $/Well-Month - Monthly Trend (Net, all wells)"}));
-  root.appendChild(el("div",{cls:"dim",style:"font-size:11px; margin-top:-6px; margin-bottom:4px;",text:"Chart uses all wells regardless of activity filter — to see filtered values use the Monthly LOS Table tab."}));
+  root.appendChild(el("h2",{text:"2025 Opex Breakdown by Asset (Net basis, side-by-side)"}));
   const c2 = el("div",{cls:"panel"});
-  c2.appendChild(el("canvas",{id:"chart-summary-fixed",cls:"chart-wrap tall"}));
+  c2.appendChild(el("canvas",{id:"chart-summary-opex",cls:"chart-wrap tall"}));
   root.appendChild(c2);
 
   const assetsX = ["Hawkeye","Strawn","Reeves","Genesis","Consolidated"];
@@ -442,21 +441,26 @@ function renderSummary() {
     },
   });
 
-  const periods = DATA.series.Consolidated.periods;
-  new Chart(document.getElementById("chart-summary-fixed"), {
-    type:"line",
-    data:{ labels: periods,
-      datasets: ["Hawkeye","Strawn","Reeves","Genesis","Consolidated"].map(function(a){ return {
-        label: a, data: DATA.series[a].bases.Net.Fixed_per_Well,
-        borderColor: ASSET_COLOR[a], backgroundColor: ASSET_COLOR[a]+"22",
-        borderWidth: a==="Consolidated"?2.5:1.5, pointRadius:0, pointHoverRadius:4, tension:0.25,
-      }; }),
-    },
+  // 2025 opex breakdown: X-axis = assets, datasets = Variable Opex / Fixed Opex / Workover / Capex
+  // Bars grouped SIDE-BY-SIDE (Chart.js default for bar chart with multiple datasets).
+  const opexAssets = ["Hawkeye","Strawn","Reeves","Genesis","Consolidated"];
+  const annualNet = opexAssets.map(function(a){ return getAnnual(a, 2025, "Net") || {}; });
+  const opexDatasets = [
+    {label:"Variable Opex", color:"#ffb347", data: annualNet.map(function(r){ return r.Var_Opex || 0; })},
+    {label:"Fixed Opex",    color:"#e87a5d", data: annualNet.map(function(r){ return r.Fixed_Opex || 0; })},
+    {label:"Workover",      color:"#b788ff", data: annualNet.map(function(r){ return r.Workover  || 0; })},
+    {label:"Capex",         color:"#7ab5ff", data: annualNet.map(function(r){ return r.Total_Capex || 0; })},
+  ].map(function(d){
+    return { label:d.label, data:d.data, backgroundColor:d.color+"cc", borderColor:d.color, borderWidth:1 };
+  });
+  new Chart(document.getElementById("chart-summary-opex"), {
+    type:"bar",
+    data:{ labels: opexAssets, datasets: opexDatasets },
     options:{ responsive:true, maintainAspectRatio:false,
-      plugins:{legend:{position:"top",labels:{boxWidth:12,padding:12}},
-        tooltip:{callbacks:{label: function(c){ return c.dataset.label+": $"+Math.round(c.parsed.y).toLocaleString()+"/well-mo"; }}}},
-      scales:{ y:{beginAtZero:true,grid:{color:"#2a2a30"},ticks:{callback:function(v){return "$"+(v/1000).toFixed(0)+"k";}}},
-               x:{grid:{display:false},ticks:{maxRotation:45,autoSkip:true,maxTicksLimit:14}}},
+      plugins:{ legend:{position:"top",labels:{boxWidth:12,padding:12}},
+        tooltip:{callbacks:{label:function(c){ return c.dataset.label+": "+fmtMoneyFull(c.parsed.y); }}}},
+      scales:{ y:{beginAtZero:true,grid:{color:"#2a2a30"},ticks:{callback:function(v){return fmtMoney(v);}}},
+               x:{grid:{display:false}}},
     },
   });
 }
@@ -471,15 +475,19 @@ function renderTrends() {
   const root = document.getElementById("tab-trends");
   clear(root);
   const ASSETS_NO_CONSOL = ["Hawkeye","Strawn","Reeves","Genesis"];
+  const ASSETS_WITH_CONSOL = ASSETS_NO_CONSOL.concat(["Consolidated"]);
 
   // ---- Asset filter (applies to ALL charts on this tab) ----
+  // Consolidated is included as a 5th toggle; when on, a separate Consolidated
+  // series is shown alongside the individual assets.
   const flex = el("div",{cls:"flex"});
   flex.appendChild(el("label",{cls:"dim",text:"Assets:"}));
   const assetCtrl = el("div",{style:"display:flex; gap:6px; flex-wrap:wrap;"});
-  ASSETS_NO_CONSOL.forEach(function(a){
+  ASSETS_WITH_CONSOL.forEach(function(a){
     const lbl = el("label",{style:"display:inline-flex; align-items:center; gap:5px; background:var(--panel2); border:1px solid var(--border); border-radius:4px; padding:4px 9px; cursor:pointer;"});
     const cb = el("input",{attrs:{type:"checkbox","data-asset":a}});
-    cb.checked = true;
+    // Default: individual assets checked, Consolidated OFF (avoid scale clash with asset bars)
+    cb.checked = (a !== "Consolidated");
     lbl.appendChild(cb);
     lbl.appendChild(el("span",{cls:"asset-"+a.toLowerCase(),style:"font-weight:600;",text:a}));
     assetCtrl.appendChild(lbl);
@@ -530,6 +538,12 @@ function renderTrends() {
   p6.appendChild(el("canvas",{id:"chart-capex",cls:"chart-wrap tall"}));
   root.appendChild(p6);
 
+  // ---- Chart 7: Opex Intensity (Cash Opex / Revenue) — quarterly by asset ----
+  root.appendChild(el("h2",{text:"Opex Intensity (Cash Opex / Revenue) — Quarterly by Asset"}));
+  const p7 = el("div",{cls:"panel"});
+  p7.appendChild(el("canvas",{id:"chart-opexint",cls:"chart-wrap tall"}));
+  root.appendChild(p7);
+
   // ---------- Helpers for quarterly aggregation ----------
   const getSelectedAssets = function() {
     const out = [];
@@ -567,16 +581,36 @@ function renderTrends() {
     // Sort labels chronologically
     const labels = Object.keys(qMap).sort();
     const byAsset = {};
-    ASSETS_NO_CONSOL.forEach(function(asset){
-      byAsset[asset] = {
-        Revenue:[], Cash:[], Capex:[], EBITDA:[], EBITDA_Margin:[],
-        FCF:[], FCF_Margin:[], BOE:[], BOEd:[], CashPerBOE:[],
-      };
-      for (const qkey of labels) {
-        const a = (qMap[qkey] && qMap[qkey][asset]) || null;
+    const metricKeys = ["Revenue","Cash","Capex","EBITDA","EBITDA_Margin",
+                        "FCF","FCF_Margin","BOE","BOEd","CashPerBOE","OpexIntensity"];
+    ASSETS_WITH_CONSOL.forEach(function(asset){
+      byAsset[asset] = {};
+      metricKeys.forEach(function(k){ byAsset[asset][k] = []; });
+    });
+    for (const qkey of labels) {
+      // First compute per-asset aggregates for this quarter
+      const perAsset = {};
+      ASSETS_NO_CONSOL.forEach(function(asset){
+        perAsset[asset] = (qMap[qkey] && qMap[qkey][asset]) || null;
+      });
+      // Consolidated = sum across 4 assets for this quarter
+      let consAgg = null;
+      for (const asset of ASSETS_NO_CONSOL) {
+        const a = perAsset[asset];
+        if (!a) continue;
+        if (!consAgg) consAgg = {Revenue:0,Var:0,Fix:0,WO:0,Netback:0,Sev:0,Adval:0,Capex:0,BOE:0,Months:0};
+        consAgg.Revenue += a.Revenue; consAgg.Var += a.Var; consAgg.Fix += a.Fix;
+        consAgg.WO += a.WO; consAgg.Netback += a.Netback; consAgg.Sev += a.Sev;
+        consAgg.Adval += a.Adval; consAgg.Capex += a.Capex; consAgg.BOE += a.BOE;
+        consAgg.Months = Math.max(consAgg.Months, a.Months);  // max months across assets in the quarter
+      }
+      perAsset.Consolidated = consAgg;
+
+      ASSETS_WITH_CONSOL.forEach(function(asset){
+        const a = perAsset[asset];
         if (!a || a.Revenue === 0) {
-          ["Revenue","Cash","Capex","EBITDA","EBITDA_Margin","FCF","FCF_Margin","BOE","BOEd","CashPerBOE"].forEach(function(k){ byAsset[asset][k].push(0); });
-          continue;
+          metricKeys.forEach(function(k){ byAsset[asset][k].push(0); });
+          return;
         }
         const cashOpex = a.Var + a.Fix + a.WO;
         const netRev = a.Revenue - a.Netback - a.Sev - a.Adval;
@@ -595,8 +629,9 @@ function renderTrends() {
         byAsset[asset].BOE.push(a.BOE);
         byAsset[asset].BOEd.push(a.BOE / days);
         byAsset[asset].CashPerBOE.push(a.BOE ? cashOpex / a.BOE : 0);
-      }
-    });
+        byAsset[asset].OpexIntensity.push(a.Revenue ? cashOpex / a.Revenue : 0);
+      });
+    }
     // Pretty labels: Q1-24, Q2-24, ...
     const prettyLabels = labels.map(function(q){
       const parts = q.split("-Q");
@@ -636,10 +671,15 @@ function renderTrends() {
     });
 
     // Chart 2 — Revenue + Cost stack (sum across SELECTED assets, same basis)
+    // Avoid double-counting: if Consolidated is among the selected assets, use ONLY
+    // Consolidated for the stack. Otherwise sum the selected individual assets.
     const n = periods.length;
+    const stackAssets = (selected.indexOf("Consolidated") >= 0)
+      ? ["Consolidated"]
+      : selected.filter(function(a){ return a !== "Consolidated"; });
     const sumArr = function(field){
       const out = new Array(n).fill(0);
-      for (const a of selected) {
+      for (const a of stackAssets) {
         const arr = DATA.series[a].bases[basis][field];
         for (let i=0; i<n; i++) out[i] += arr[i] || 0;
       }
@@ -715,6 +755,7 @@ function renderTrends() {
     makeBarChart("chart-fcf",     "FCF_Margin",    "pct");
     makeBarChart("chart-cashcost","CashPerBOE",    "money2");
     makeBarChart("chart-capex",   "Capex",         "money");
+    makeBarChart("chart-opexint", "OpexIntensity", "pct");
   };
 
   saBasis.addEventListener("change", render);
