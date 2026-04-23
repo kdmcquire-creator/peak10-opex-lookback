@@ -1925,6 +1925,163 @@ function buildSparkline(series, anomalyIdxSet, opts) {
   return svg;
 }
 
+// ---- Variance decomposition (Phase 2) ----
+// For margin flags, decompose the EBITDA change into price / volume / cost effects
+// using Laspeyres-style attribution: each driver measured at prior-period weights.
+// Returns {components: [{name, dollar, pp, favorable}], margin_delta_pp}
+function decomposeMarginChange(asset, year, month) {
+  const curr = DATA.monthly_table.find(function(r){
+    return r.Basis === "Net" && r.Asset === asset && r.Year === year && r.Month === month;
+  });
+  if (!curr) return null;
+
+  // Baseline = average of the 3 months prior
+  let count = 0;
+  const base = {Oil_bbl:0,Gas_mcf:0,NGL_bbl:0,Oil_Revenue:0,Gas_Revenue:0,NGL_Revenue:0,
+                Gross_Revenue:0,Gas_Netback:0,Severance:0,Adval:0,
+                Var_Opex:0,Fixed_Opex:0,Workover:0,Total_Capex:0};
+  for (let dm = 1; dm <= 3; dm++) {
+    let ym = year, mm = month - dm;
+    if (mm <= 0) { ym--; mm += 12; }
+    const pr = DATA.monthly_table.find(function(r){
+      return r.Basis === "Net" && r.Asset === asset && r.Year === ym && r.Month === mm;
+    });
+    if (!pr) continue;
+    count++;
+    for (const k of Object.keys(base)) base[k] += pr[k] || 0;
+  }
+  if (count === 0) return null;
+  for (const k of Object.keys(base)) base[k] /= count;
+
+  // Price × Volume decomposition for each commodity
+  const pxv = function(rev0, vol0, rev1, vol1) {
+    const p0 = vol0 ? rev0/vol0 : 0;
+    const p1 = vol1 ? rev1/vol1 : 0;
+    return { priceEffect: (p1 - p0) * vol0, volumeEffect: p1 * (vol1 - vol0) };
+  };
+  const oil = pxv(base.Oil_Revenue, base.Oil_bbl, curr.Oil_Revenue, curr.Oil_bbl);
+  const gas = pxv(base.Gas_Revenue, base.Gas_mcf, curr.Gas_Revenue, curr.Gas_mcf);
+  const ngl = pxv(base.NGL_Revenue, base.NGL_bbl, curr.NGL_Revenue, curr.NGL_bbl);
+
+  const priceEffect  = oil.priceEffect + gas.priceEffect + ngl.priceEffect;
+  const volumeEffect = oil.volumeEffect + gas.volumeEffect + ngl.volumeEffect;
+  const netbackChange = -(curr.Gas_Netback - base.Gas_Netback);
+  const sevChange     = -(curr.Severance - base.Severance);
+  const advalChange   = -(curr.Adval - base.Adval);
+  const varChange     = -(curr.Var_Opex - base.Var_Opex);
+  const fixChange     = -(curr.Fixed_Opex - base.Fixed_Opex);
+  const woChange      = -(curr.Workover - base.Workover);
+
+  // Express each as pp of baseline revenue
+  const baseRev = base.Gross_Revenue || 1;
+  const ppOf = function(x) { return (x / baseRev) * 100; };
+
+  const components = [
+    { name: "Oil price",     dollar: oil.priceEffect,  pp: ppOf(oil.priceEffect),  group:"revenue" },
+    { name: "Gas price",     dollar: gas.priceEffect,  pp: ppOf(gas.priceEffect),  group:"revenue" },
+    { name: "NGL price",     dollar: ngl.priceEffect,  pp: ppOf(ngl.priceEffect),  group:"revenue" },
+    { name: "Oil volume",    dollar: oil.volumeEffect, pp: ppOf(oil.volumeEffect), group:"revenue" },
+    { name: "Gas volume",    dollar: gas.volumeEffect, pp: ppOf(gas.volumeEffect), group:"revenue" },
+    { name: "NGL volume",    dollar: ngl.volumeEffect, pp: ppOf(ngl.volumeEffect), group:"revenue" },
+    { name: "Gas netback",   dollar: netbackChange,    pp: ppOf(netbackChange),    group:"deducts"  },
+    { name: "Severance",     dollar: sevChange,        pp: ppOf(sevChange),        group:"deducts"  },
+    { name: "Ad val",        dollar: advalChange,      pp: ppOf(advalChange),      group:"deducts"  },
+    { name: "Variable opex", dollar: varChange,        pp: ppOf(varChange),        group:"cost"     },
+    { name: "Fixed opex",    dollar: fixChange,        pp: ppOf(fixChange),        group:"cost"     },
+    { name: "Workover",      dollar: woChange,         pp: ppOf(woChange),         group:"cost"     },
+  ];
+  // Sort by absolute pp contribution
+  components.sort(function(a,b){ return Math.abs(b.pp) - Math.abs(a.pp); });
+
+  // Aggregate by group
+  const byGroup = {revenue:0, deducts:0, cost:0};
+  components.forEach(function(c){ byGroup[c.group] += c.pp; });
+  const totalPp = byGroup.revenue + byGroup.deducts + byGroup.cost;
+
+  return { components: components, byGroup: byGroup, totalPp: totalPp, baseRev: baseRev };
+}
+
+// ---- Narrative generator (rule-based, Phase 2) ----
+// Produces a 1-2 sentence plain-English summary for a flag using decomposition
+// and drill-down data when available.
+function generateNarrative(flag) {
+  const m = flag.metric;
+  const asset = flag.asset;
+  const period = flag.period;
+  const direction = flag.dev > 0 ? "up" : "down";
+  const favorable = (flag.dev > 0) === m.up;
+  const pctChange = flag.baseline ? (flag.dev / Math.abs(flag.baseline) * 100) : null;
+
+  // Parse period (e.g. "Jul-24") back to year/month
+  const parts = period.split("-");
+  const mMap = {Jan:1,Feb:2,Mar:3,Apr:4,May:5,Jun:6,Jul:7,Aug:8,Sep:9,Oct:10,Nov:11,Dec:12};
+  const year = 2000 + parseInt(parts[1]);
+  const month = mMap[parts[0]];
+
+  let lead = asset + " " + m.label + " moved " + direction;
+  if (pctChange !== null && Math.abs(pctChange) < 999) {
+    lead += " " + (pctChange > 0 ? "+" : "") + pctChange.toFixed(0) + "%";
+  }
+  lead += " in " + period + " (" + fmtByType(flag.value, m.fmt) + " vs "
+        + fmtByType(flag.baseline, m.fmt) + " baseline; σ=" + flag.sigmas.toFixed(1) + ").";
+
+  // Persistence context
+  const persistence = flag.tag === "TIMING"   ? "Single-month deviation — likely accrual timing or one-off event." :
+                      flag.tag === "CAMPAIGN" ? "Persisted 2–3 months then reverted — consistent with a campaign or temporary driver." :
+                      flag.tag === "STRUCTURAL" ? "Persists multiple months without reversal — step change, not a timing issue." :
+                      flag.tag === "IMPROVEMENT" ? "Persistent favorable move — possible operational improvement, renegotiation, or scope reduction." :
+                      "";
+
+  let driver = "";
+
+  // Margin flags: use variance decomposition
+  if (m.id === "EBITDA_Margin" || m.id === "FCF_Margin") {
+    const d = decomposeMarginChange(asset, year, month);
+    if (d) {
+      const top = d.components.filter(function(c){ return Math.abs(c.pp) >= 1.0; }).slice(0, 3);
+      if (top.length) {
+        const parts = top.map(function(c){
+          const sgn = c.pp > 0 ? "+" : "";
+          return c.name + " " + sgn + c.pp.toFixed(1) + "pp";
+        });
+        driver = "Top drivers vs prior-3-mo baseline: " + parts.join(", ") + ".";
+      }
+      // Also indicate if revenue or cost is dominant
+      const absRev = Math.abs(d.byGroup.revenue);
+      const absCost = Math.abs(d.byGroup.cost);
+      if (absRev > absCost * 1.5) driver += " Primarily revenue-driven.";
+      else if (absCost > absRev * 1.5) driver += " Primarily cost-driven.";
+      else driver += " Mix of revenue and cost effects.";
+    }
+  }
+
+  // Cost flags: use sub-bucket drill
+  const bucket = m.id === "Var_per_BOE" ? "VAR_OPEX" :
+                 m.id === "Fixed_per_Wellmo" ? "FIX_OPEX" :
+                 m.id === "Workover_per_Wellmo" ? "WORKOVER" :
+                 m.id === "Field_Personnel_per_Well" ? "FIX_OPEX" :
+                 null;
+  if (bucket && !driver) {
+    const drill = costDrillDown(asset, year, month, bucket);
+    if (drill && drill.length) {
+      const top = drill.slice(0, 3);
+      const parts = top.map(function(d){
+        const sgn = d.delta > 0 ? "+" : "";
+        return d.sub + " " + sgn + fmtMoney(d.delta);
+      });
+      driver = "Top sub-category changes vs prior-3-mo avg: " + parts.join(", ") + ".";
+    }
+  }
+
+  // Commodity flags: context
+  if (m.id === "Oil_Diff_WTI" || m.id === "Gas_Diff_HH") {
+    if (!favorable) driver = "Realized price discount widened vs benchmark — could indicate basis drift, marketing/contract change, or gas processing shrinkage.";
+    else driver = "Realized price discount narrowed vs benchmark.";
+  }
+
+  return { lead: lead, persistence: persistence, driver: driver };
+}
+
 function costDrillDown(asset, year, month, bucket) {
   const row = DATA.monthly_table.find(function(r){
     return r.Basis === "Net" && r.Asset === asset && r.Year === year && r.Month === month;
@@ -2058,17 +2215,13 @@ function renderInsights() {
       hdr.appendChild(el("span",{cls:"dim",style:"font-size:11px;",text:"σ=" + f.sigmas.toFixed(1)}));
       card.appendChild(hdr);
 
-      const dirText = f.dev > 0 ? "up" : "down";
-      const dirOK = (f.dev > 0) === f.metric.up;
-      const detail = el("div",{cls:"ins-flag-detail"});
-      const deltaAbs = fmtByType(f.value, f.metric.fmt) + " vs " + fmtByType(f.baseline, f.metric.fmt) + " baseline";
-      const pctChange = f.baseline ? (f.dev / Math.abs(f.baseline) * 100) : null;
-      let detailText = "Observed " + deltaAbs + " — " + (dirOK ? "favorable" : "unfavorable") + " move " + dirText;
-      if (pctChange !== null && Math.abs(pctChange) < 999) {
-        detailText += " (" + (pctChange > 0 ? "+" : "") + pctChange.toFixed(0) + "% vs baseline)";
-      }
-      detail.textContent = detailText;
-      card.appendChild(detail);
+      // Narrative (Phase 2) — combines decomposition + persistence into plain-English summary
+      const narr = generateNarrative(f);
+      const narrWrap = el("div",{cls:"ins-flag-detail",style:"line-height:1.6;"});
+      narrWrap.appendChild(el("div",{style:"color:var(--text);margin-bottom:4px;",text:narr.lead}));
+      if (narr.persistence) narrWrap.appendChild(el("div",{style:"color:var(--text-dim);font-style:italic;margin-bottom:4px;",text:narr.persistence}));
+      if (narr.driver)      narrWrap.appendChild(el("div",{style:"color:var(--text-dim);",text:narr.driver}));
+      card.appendChild(narrWrap);
 
       const series = DATA.insight_metrics[f.asset][f.metric.id];
       const anomalyIdx = detectAnomalies(series, {threshold: threshold}).map(function(x){ return x.i; });
@@ -2076,8 +2229,64 @@ function renderInsights() {
       spkWrap.appendChild(buildSparkline(series, anomalyIdx, {width: 500, height: 44}));
       card.appendChild(spkWrap);
 
+      const isMarginFlag = (f.metric.id === "EBITDA_Margin" || f.metric.id === "FCF_Margin");
+      if (isMarginFlag) {
+        const btnRow = el("div",{style:"margin-top:8px;"});
+        const btn = el("button",{cls:"ins-decompose-btn",text:"▸ Variance decomposition"});
+        btnRow.appendChild(btn);
+        card.appendChild(btnRow);
+        const decomp = el("div",{cls:"ins-decompose"});
+        card.appendChild(decomp);
+        btn.addEventListener("click", function(){
+          const isOpen = decomp.classList.toggle("open");
+          btn.textContent = (isOpen ? "▾" : "▸") + " Variance decomposition";
+          if (isOpen && !decomp.dataset.filled) {
+            const parts = f.period.split("-");
+            const mname = parts[0], yy = parts[1];
+            const mMap = {Jan:1,Feb:2,Mar:3,Apr:4,May:5,Jun:6,Jul:7,Aug:8,Sep:9,Oct:10,Nov:11,Dec:12};
+            const year = 2000 + parseInt(yy);
+            const month = mMap[mname];
+            clear(decomp);
+            const d = decomposeMarginChange(f.asset, year, month);
+            if (d) {
+              decomp.appendChild(el("div",{style:"font-weight:600; color:var(--text); margin-bottom:6px;",
+                text:"Contribution to margin change vs prior 3-mo avg (expressed as pp of baseline revenue):"}));
+              const grp = el("div",{style:"display:flex; gap:12px; margin-bottom:8px; font-size:11px;"});
+              ["revenue","deducts","cost"].forEach(function(g){
+                const chip = el("div",{style:"background:var(--panel); padding:4px 10px; border-radius:3px; border:1px solid var(--border);"});
+                const pp = d.byGroup[g];
+                const sign = pp > 0 ? "+" : "";
+                const color = pp > 0 ? "#7ed1a8" : (pp < 0 ? "#ff7676" : "var(--text-dim)");
+                chip.appendChild(el("span",{cls:"dim",style:"margin-right:6px;",text:g + ":"}));
+                chip.appendChild(el("span",{style:"color:" + color + "; font-weight:600;", text: sign + pp.toFixed(1) + "pp"}));
+                grp.appendChild(chip);
+              });
+              decomp.appendChild(grp);
+              d.components.forEach(function(c){
+                if (Math.abs(c.pp) < 0.2) return; // skip tiny components
+                const row = el("div",{style:"display:flex; justify-content:space-between; padding:3px 0; font-size:12px;"});
+                row.appendChild(el("span",{text:c.name + " (" + c.group + ")"}));
+                const sgn = c.pp > 0 ? "+" : "";
+                const col = c.pp > 0 ? "#7ed1a8" : "#ff7676";
+                const right = el("span",{style:"color:" + col + ";"});
+                right.appendChild(document.createTextNode(sgn + c.pp.toFixed(1) + "pp"));
+                right.appendChild(el("span",{cls:"dim",style:"margin-left:8px; font-variant-numeric:tabular-nums;",text:"(" + (c.dollar>0?"+":"") + fmtMoney(c.dollar) + ")"}));
+                row.appendChild(right);
+                decomp.appendChild(row);
+              });
+            } else {
+              decomp.textContent = "Decomposition not available (missing baseline months).";
+            }
+            decomp.dataset.filled = "1";
+          }
+        });
+      }
+
+      // OpexIntensity is cost-category but doesn't map to a single sub-bucket;
+      // variance decomposition (already available for margin flags) is more useful
+      // for it, so we don't add a sub-bucket drill button for that metric.
       const isCostFlag = (f.metric.id === "Var_per_BOE" || f.metric.id === "Fixed_per_Wellmo" ||
-                          f.metric.id === "Workover_per_Wellmo" || f.metric.id === "OpexIntensity" ||
+                          f.metric.id === "Workover_per_Wellmo" ||
                           f.metric.id === "Field_Personnel_per_Well");
       if (isCostFlag) {
         const btnRow = el("div",{style:"margin-top:8px;"});
@@ -2124,15 +2333,16 @@ function renderInsights() {
       flagsWrap.appendChild(card);
     }
 
-    // Field Personnel consistency panel
+    // Field Personnel consistency panel — click any row to drill into well-level breakdown
     clear(fpPanel);
     const consistency = DATA.field_personnel_consistency || {};
+    const fpWells = DATA.field_personnel_wells || {};
     const panel = el("div",{cls:"panel",style:"overflow-x:auto; padding:14px;"});
     const table = el("table");
     const thead = el("thead");
     const thr = el("tr");
-    ["Asset","Line","Wells","Top-3 Share","Flag","Trailing 12-mo $"].forEach(function(h,i){
-      const th = el("th",{text:h}); if (i>=2) th.className = "num"; thr.appendChild(th);
+    ["","Asset","Line","Wells","Top-3 Share","Flag","Trailing 12-mo $"].forEach(function(h,i){
+      const th = el("th",{text:h}); if (i>=3) th.className = "num"; thr.appendChild(th);
     });
     thead.appendChild(thr); table.appendChild(thead);
     const tbody = el("tbody");
@@ -2141,7 +2351,12 @@ function renderInsights() {
       const lines = Object.keys(a_consistency).sort();
       for (const line of lines) {
         const c = a_consistency[line];
-        const tr = el("tr");
+        const tr = el("tr",{style:"cursor:pointer;"});
+        // Expander caret cell
+        const caretCell = el("td");
+        const caret = el("span",{cls:"caret",style:"display:inline-block; width:10px; color:var(--text-dim); font-size:10px; transition:transform 0.15s;", text:"▶"});
+        caretCell.appendChild(caret);
+        tr.appendChild(caretCell);
         const td1 = el("td");
         td1.appendChild(el("span",{cls:"asset-"+asset.toLowerCase(),style:"font-weight:600;",text:asset}));
         tr.appendChild(td1);
@@ -2155,6 +2370,69 @@ function renderInsights() {
         tr.appendChild(fltd);
         tr.appendChild(el("td",{cls:"num",text:fmtMoneyFull(c.total_12mo)}));
         tbody.appendChild(tr);
+
+        // Hidden well-level detail row
+        const detailTr = el("tr",{style:"display:none; background:rgba(255,255,255,0.02);"});
+        const detailTd = el("td",{attrs:{colspan:"7"},style:"padding:12px 20px;"});
+        detailTr.appendChild(detailTd);
+        tbody.appendChild(detailTr);
+
+        let detailBuilt = false;
+        tr.addEventListener("click", function(){
+          const open = detailTr.style.display !== "none";
+          if (open) {
+            detailTr.style.display = "none";
+            caret.style.transform = "rotate(0deg)";
+          } else {
+            detailTr.style.display = "";
+            caret.style.transform = "rotate(90deg)";
+            if (!detailBuilt) {
+              const assetWells = fpWells[asset] || {};
+              // Collect per-well totals (trailing 12 months, same logic as consistency)
+              const rows = [];
+              for (const propCode in assetWells) {
+                const w = assetWells[propCode];
+                const monthData = (w.lines || {})[line] || {};
+                let total = 0;
+                let months = 0;
+                const monthKeys = Object.keys(monthData).sort().slice(-13);
+                monthKeys.forEach(function(k){ total += Math.abs(monthData[k]); if (monthData[k] !== 0) months++; });
+                if (total === 0) continue;
+                rows.push({propCode: propCode, name: w.name, total: total, months: months, byMonth: monthData});
+              }
+              rows.sort(function(a,b){ return b.total - a.total; });
+              const sumAll = rows.reduce(function(s,r){ return s + r.total; }, 0);
+
+              const subTable = el("table",{style:"width:100%; font-size:11px;"});
+              const sth = el("thead");
+              const sthr = el("tr");
+              ["Well","Trailing 12-mo $","Months w/ activity","% of line"].forEach(function(h,i){
+                const th = el("th",{text:h,style:"font-size:10px;"});
+                if (i>=1) th.className = "num"; sthr.appendChild(th);
+              });
+              sth.appendChild(sthr); subTable.appendChild(sth);
+              const stb = el("tbody");
+              rows.forEach(function(r){
+                const rr = el("tr");
+                rr.appendChild(el("td",{text:r.name + " (" + r.propCode + ")"}));
+                rr.appendChild(el("td",{cls:"num",text:fmtMoneyFull(r.total)}));
+                rr.appendChild(el("td",{cls:"num",text:String(r.months)}));
+                const pct = sumAll ? (r.total/sumAll) : 0;
+                rr.appendChild(el("td",{cls:"num",text:fmtPct(pct)}));
+                stb.appendChild(rr);
+              });
+              subTable.appendChild(stb);
+              if (rows.length === 0) {
+                detailTd.appendChild(el("div",{cls:"dim",text:"No well-level data available for this line."}));
+              } else {
+                detailTd.appendChild(el("div",{cls:"dim",style:"margin-bottom:6px; font-size:11px;",
+                  text:"Well-level breakdown, " + asset + " — " + line + " (trailing ~12 months, sorted by spend):"}));
+                detailTd.appendChild(subTable);
+              }
+              detailBuilt = true;
+            }
+          }
+        });
       }
     }
     table.appendChild(tbody);
