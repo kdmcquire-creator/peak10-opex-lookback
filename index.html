@@ -101,14 +101,24 @@
                          background: var(--panel2); z-index: 20;
                          box-shadow: 0 1px 0 var(--border); }
 
+  /* Section header rows: all cells sticky at top (below thead). The first-col
+     label cell is ALSO sticky-left so it remains visible when scrolling horizontally.
+     Row is structured as: [label TD] + N filler TDs (no colspan). */
   #mlos-table tr.mlos-section-hdr td {
     position: sticky;
     top: var(--mlos-section-top, 34px);
-    left: 0;
     background: #E8EDF3 !important;
     color: var(--accent) !important;
     z-index: 15;
     box-shadow: 0 1px 0 var(--border);
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    font-size: 10px;
+  }
+  #mlos-table tr.mlos-section-hdr td.first-col {
+    left: 0;
+    z-index: 18;  /* above body first-col (10) + regular thead cells (20 top only) */
   }
 
   #mlos-table td.first-col, #mlos-table th.first-col {
@@ -697,8 +707,34 @@ function renderTrends() {
   root.appendChild(flex);
   root.appendChild(el("div",{cls:"dim",style:"font-size:11px; margin-bottom:8px;",text:"Tip: click legend items to toggle; double-click to isolate a single series."}));
 
-  // ---- Chart 1: BOE/d over time (line chart by asset, from monthly series) ----
-  root.appendChild(el("h2",{text:"BOE/d — Monthly Trend"}));
+  // ---- Chart 1: Daily production (line chart by asset) with Oil/Gas/BOE toggle ----
+  const h1 = el("h2");
+  h1.textContent = "Daily Production — Monthly Trend ";
+  const prodToggle = el("div",{style:"display:inline-flex; gap:2px; margin-left:12px; background:var(--panel2); padding:3px; border-radius:5px; border:1px solid var(--border); vertical-align:middle;"});
+  const prodBtn = function(val, label, active){
+    const b = el("button",{attrs:{"data-prod":val},style:"background:"+(active?"var(--panel)":"transparent")+"; color:"+(active?"var(--text)":"var(--text-dim)")+"; border:none; padding:5px 12px; border-radius:3px; cursor:pointer; font-size:12px; font-family:inherit; font-weight:600;"});
+    b.textContent = label; return b;
+  };
+  const btnBOEd = prodBtn("BOE","BOE/d", true);
+  const btnOil  = prodBtn("OIL","Oil bbl/d", false);
+  const btnGas  = prodBtn("GAS","Gas Mcf/d", false);
+  prodToggle.appendChild(btnBOEd);
+  prodToggle.appendChild(btnOil);
+  prodToggle.appendChild(btnGas);
+  h1.appendChild(prodToggle);
+  root.appendChild(h1);
+  let prodMode = "BOE";
+  const setProdMode = function(v){
+    prodMode = v;
+    [[btnBOEd,"BOE"],[btnOil,"OIL"],[btnGas,"GAS"]].forEach(function(pair){
+      const active = pair[1] === v;
+      pair[0].style.background = active ? "var(--panel)" : "transparent";
+      pair[0].style.color      = active ? "var(--text)" : "var(--text-dim)";
+    });
+  };
+  btnBOEd.addEventListener("click", function(){ setProdMode("BOE"); render(); });
+  btnOil.addEventListener("click",  function(){ setProdMode("OIL"); render(); });
+  btnGas.addEventListener("click",  function(){ setProdMode("GAS"); render(); });
   const p1 = el("div",{cls:"panel"});
   p1.appendChild(el("canvas",{id:"chart-boed",cls:"chart-wrap tall"}));
   root.appendChild(p1);
@@ -880,13 +916,15 @@ function renderTrends() {
     const selected = getSelectedAssets();
     const periods = DATA.series.Consolidated.periods;
 
-    // Chart 1 — BOE/d monthly line chart per selected asset
+    // Chart 1 — Daily production line chart per selected asset
+    // Data source depends on prodMode toggle: BOE/d, Oil bbl/d, or Gas Mcf/d
+    const prodField = prodMode === "OIL" ? "Oil_bbl" : prodMode === "GAS" ? "Gas_mcf" : "BOE";
+    const prodUnit  = prodMode === "OIL" ? "bbl/d"  : prodMode === "GAS" ? "Mcf/d"  : "BOE/d";
     const boedDatasets = selected.map(function(a){
-      // Compute BOE/d from monthly BOE + days in that month; simple = BOE/30.4375
-      const boeArr = DATA.series[a].bases[basis].BOE;
-      const boedArr = boeArr.map(function(b){ return b / 30.4375; });
+      const srcArr = DATA.series[a].bases[basis][prodField];
+      const perDay = srcArr.map(function(v){ return v / 30.4375; });
       return {
-        label: a, data: boedArr,
+        label: a, data: perDay,
         borderColor: ASSET_COLOR[a], backgroundColor: ASSET_COLOR[a]+"22",
         borderWidth: 2, pointRadius: 0, pointHoverRadius: 4, tension: 0.25,
       };
@@ -897,7 +935,7 @@ function renderTrends() {
       data:{ labels: periods, datasets: boedDatasets },
       options:{ responsive:true, maintainAspectRatio:false,
         plugins:{ legend:{position:"top",labels:{boxWidth:12}},
-          tooltip:{callbacks:{label:function(c){ return c.dataset.label+": "+fmtNum(c.parsed.y)+" BOE/d"; }}}},
+          tooltip:{callbacks:{label:function(c){ return c.dataset.label+": "+fmtNum(c.parsed.y)+" "+prodUnit; }}}},
         scales:{ y:{beginAtZero:true,grid:{color:"#E2E5E9"},ticks:{callback:function(v){return fmtNum(v);}}},
                  x:{grid:{display:false},ticks:{maxRotation:45,autoSkip:true,maxTicksLimit:14}}},
       },
@@ -1503,12 +1541,17 @@ function renderMonthly() {
     };
 
     for (const sec of sections) {
+      // Section header row: label cell is first-col (sticky left + top via CSS),
+      // followed by one filler cell per period + one for Total. No colspan so
+      // all cells individually benefit from sticky-top, and the label cell
+      // remains visible when scrolling horizontally.
       const hdrRow = el("tr",{cls:"mlos-section-hdr"});
-      // Section headers span the whole row; styling comes from the CSS class
-      // .mlos-section-hdr td which sets a Peak 10 accent background + color.
-      const hdrTd = el("td",{style:"position:sticky; left:0; z-index:10; font-weight:700; text-transform:uppercase; letter-spacing:0.05em; font-size:10px;", text:sec.title});
-      hdrTd.colSpan = periods.length + 2;
-      hdrRow.appendChild(hdrTd);
+      const hdrLabelTd = el("td",{cls:"first-col", text:sec.title});
+      hdrRow.appendChild(hdrLabelTd);
+      for (let ci = 0; ci < periods.length; ci++) {
+        hdrRow.appendChild(el("td"));
+      }
+      hdrRow.appendChild(el("td"));  // Total column filler
       tbody.appendChild(hdrRow);
       for (const row of sec.rows) {
         const tr2 = el("tr");
