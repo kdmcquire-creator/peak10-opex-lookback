@@ -1107,9 +1107,11 @@ function renderGross() {
   const flex = el("div",{cls:"flex"});
   flex.appendChild(el("label",{cls:"dim",text:"Year:"}));
   const saY = el("select",{id:"gross-year"});
-  [2024,2025,2026].forEach(function(y){
-    const o = el("option",{text:y===2026?"2026 YTD":String(y),attrs:{value:String(y)}});
-    if (y===2025) o.setAttribute("selected","");
+  // "All" + each year
+  const yearOptions = [["All","All Years"], ["2024","2024"], ["2025","2025"], ["2026","2026 YTD"]];
+  yearOptions.forEach(function(pair){
+    const o = el("option",{text:pair[1],attrs:{value:pair[0]}});
+    if (pair[0]==="2025") o.setAttribute("selected","");
     saY.appendChild(o);
   });
   flex.appendChild(saY);
@@ -1138,74 +1140,149 @@ function renderGross() {
     };
   };
 
+  const metrics = [
+    {k:"Active_Months", label:"Active Months", fmt:"int"},
+    {k:"Avg_Active_Wells", label:"Avg Active Wells", fmt:"dec"},
+    {k:"BOE", label:"BOE", fmt:"num"},
+    {k:"Gross_Revenue", label:"Gross Revenue", fmt:"money"},
+    {k:"Realized_per_BOE", label:"Realized $/BOE", fmt:"money2"},
+    {k:"Gas_Netback", label:"Gas Netback $", fmt:"money"},
+    {k:"Gas_Exp_per_Mcf", label:"Gas Exp $/Mcf", fmt:"money2"},
+    {k:"Severance", label:"Severance $", fmt:"money"},
+    {k:"Sev_pct", label:"Severance % Rev", fmt:"pct"},
+    {k:"Adval", label:"Ad Val $ (normalized)", fmt:"money"},
+    {k:"Adval_pct", label:"Ad Val % Rev", fmt:"pct"},
+    {k:"Var_Opex", label:"Variable Opex $", fmt:"money"},
+    {k:"Var_per_BOE", label:"Var $/BOE", fmt:"money2"},
+    {k:"Fixed_Opex", label:"Fixed Opex $", fmt:"money"},
+    {k:"Fixed_per_Wellmo", label:"Fixed $/Well-Mo", fmt:"money"},
+    {k:"Workover", label:"Workover $", fmt:"money"},
+    {k:"Workover_per_Wellmo", label:"Workover $/Well-Mo", fmt:"money"},
+    {k:"Total_Cash_per_BOE", label:"Total Cash LOE $/BOE", fmt:"money2"},
+    {k:"Total_Capex", label:"Total Capex $", fmt:"money"},
+    {k:"Net_Revenue", label:"Net Revenue $", fmt:"money"},
+    {k:"Cash_Op_Margin", label:"Cash Op Margin $", fmt:"money"},
+  ];
+  const ASSETS_FOR_TABLE = ["Hawkeye","Strawn","Reeves","Genesis","Consolidated"];
+
+  const formatVal = function(v, fmt) {
+    if (v === null || v === undefined || isNaN(v)) return "-";
+    if (fmt==="num")    return fmtNum(v);
+    if (fmt==="int")    return String(Math.round(v));
+    if (fmt==="dec")    return v.toFixed(1);
+    if (fmt==="money")  return fmtMoney(v);
+    if (fmt==="money2") return fmtMoney2(v);
+    if (fmt==="pct")    return fmtPct(v);
+    return String(v);
+  };
+  const valueFor = function(asset, year, basis, m) {
+    const r = getAnnual(asset, year, basis);
+    let v = r ? r[m.k] : null;
+    if ((m.k === "Fixed_per_Wellmo" || m.k === "Workover_per_Wellmo") && ACTIVITY_THRESHOLD > 0) {
+      const filt = filteredAnnual(asset, year, basis);
+      if (filt !== null) v = filt[m.k];
+    }
+    return v;
+  };
+
   const renderTable = function() {
-    const y = parseInt(document.getElementById("gross-year").value);
+    const ySel = document.getElementById("gross-year").value;
+    const isAll = ySel === "All";
     if (actWidget) actWidget.updateInfo();
     clear(wrap);
     const panel = el("div",{cls:"panel",style:"overflow-x:auto;"});
     const table = el("table");
     const thead = el("thead");
-    const tr = el("tr");
-    tr.appendChild(el("th",{text:"Metric"}));
-    ["Hawkeye","Strawn","Reeves","Genesis","Consolidated"].forEach(function(a){ tr.appendChild(el("th",{cls:"num",text:a})); });
-    thead.appendChild(tr); table.appendChild(thead);
-    const tbody = el("tbody");
-    const metrics = [
-      {k:"Active_Months", label:"Active Months", fmt:"int"},
-      {k:"Avg_Active_Wells", label:"Avg Active Wells", fmt:"dec"},
-      {k:"BOE", label:"BOE", fmt:"num"},
-      {k:"Gross_Revenue", label:"Gross Revenue", fmt:"money"},
-      {k:"Realized_per_BOE", label:"Realized $/BOE", fmt:"money2"},
-      {k:"Gas_Netback", label:"Gas Netback $", fmt:"money"},
-      {k:"Gas_Exp_per_Mcf", label:"Gas Exp $/Mcf", fmt:"money2"},
-      {k:"Severance", label:"Severance $", fmt:"money"},
-      {k:"Sev_pct", label:"Severance % Rev", fmt:"pct"},
-      {k:"Adval", label:"Ad Val $ (normalized)", fmt:"money"},
-      {k:"Adval_pct", label:"Ad Val % Rev", fmt:"pct"},
-      {k:"Var_Opex", label:"Variable Opex $", fmt:"money"},
-      {k:"Var_per_BOE", label:"Var $/BOE", fmt:"money2"},
-      {k:"Fixed_Opex", label:"Fixed Opex $", fmt:"money"},
-      {k:"Fixed_per_Wellmo", label:"Fixed $/Well-Mo", fmt:"money"},
-      {k:"Workover", label:"Workover $", fmt:"money"},
-      {k:"Workover_per_Wellmo", label:"Workover $/Well-Mo", fmt:"money"},
-      {k:"Total_Cash_per_BOE", label:"Total Cash LOE $/BOE", fmt:"money2"},
-      {k:"Total_Capex", label:"Total Capex $", fmt:"money"},
-      {k:"Net_Revenue", label:"Net Revenue $", fmt:"money"},
-      {k:"Cash_Op_Margin", label:"Cash Op Margin $", fmt:"money"},
-    ];
-    const bases = [["Net","net"], ["Gross","gross"]];
-    for (const [b, cls] of bases) {
-      const header = el("tr");
-      const th = el("td",{style:"background:var(--panel2); font-weight:600;",attrs:{colspan:"6"}});
-      th.appendChild(el("span",{cls:"badge "+cls, text:BASIS_LABEL[b]}));
-      header.appendChild(th);
-      tbody.appendChild(header);
-      for (const m of metrics) {
-        const rr = el("tr");
-        rr.appendChild(el("td",{text:m.label}));
-        for (const a of ["Hawkeye","Strawn","Reeves","Genesis","Consolidated"]) {
-          const r = getAnnual(a, y, b);
-          let v = r ? r[m.k] : null;
-          // Override Fix $/Well-Mo and WO $/Well-Mo with filtered values when activity filter is on
-          if ((m.k === "Fixed_per_Wellmo" || m.k === "Workover_per_Wellmo") && ACTIVITY_THRESHOLD > 0) {
-            const filt = filteredAnnual(a, y, b);
-            if (filt !== null) v = filt[m.k];
-          }
-          let disp = "-";
-          if (v !== null && v !== undefined && !isNaN(v)) {
-            if (m.fmt==="num") disp = fmtNum(v);
-            else if (m.fmt==="int") disp = String(Math.round(v));
-            else if (m.fmt==="dec") disp = v.toFixed(1);
-            else if (m.fmt==="money") disp = fmtMoney(v);
-            else if (m.fmt==="money2") disp = fmtMoney2(v);
-            else if (m.fmt==="pct") disp = fmtPct(v);
-          }
-          rr.appendChild(el("td",{cls:"num",text:disp}));
+
+    if (isAll) {
+      // ── All-years layout ──
+      // Find years where ANY asset has data
+      const yearsAvail = [];
+      [2023,2024,2025,2026].forEach(function(y){
+        const anyHas = ASSETS_FOR_TABLE.some(function(a){
+          const r = getAnnual(a, y, "Net");
+          return r && (r.BOE > 0 || r.Gross_Revenue > 0);
+        });
+        if (anyHas) yearsAvail.push(y);
+      });
+      // Header row 1: Metric | Asset (colspan = years)
+      const tr1 = el("tr");
+      const metricTh = el("th",{text:"Metric",attrs:{rowspan:"2"},style:"vertical-align:bottom; min-width:200px;"});
+      tr1.appendChild(metricTh);
+      ASSETS_FOR_TABLE.forEach(function(a){
+        const th = el("th",{cls:"asset-"+a.toLowerCase(),
+                            attrs:{colspan:String(yearsAvail.length)},
+                            style:"text-align:center; font-weight:700; border-left:1px solid var(--border);"});
+        th.textContent = a;
+        tr1.appendChild(th);
+      });
+      thead.appendChild(tr1);
+      // Header row 2: years repeated under each asset
+      const tr2 = el("tr");
+      ASSETS_FOR_TABLE.forEach(function(a, aIdx){
+        yearsAvail.forEach(function(y, yIdx){
+          const yLabel = (y===2026 ? "2026 YTD" : y===2023 ? "2023 Q4" : String(y));
+          const th = el("th",{cls:"num",text:yLabel,
+            style: yIdx===0 ? "border-left:1px solid var(--border);" : ""});
+          tr2.appendChild(th);
+        });
+      });
+      thead.appendChild(tr2);
+      table.appendChild(thead);
+
+      const tbody = el("tbody");
+      const bases = [["Net","net"], ["Gross","gross"]];
+      const ttlCols = ASSETS_FOR_TABLE.length * yearsAvail.length + 1;
+      for (const [b, cls] of bases) {
+        const header = el("tr");
+        const th = el("td",{style:"background:var(--panel2); font-weight:700;",
+                            attrs:{colspan:String(ttlCols)}});
+        th.appendChild(el("span",{cls:"badge "+cls, text:BASIS_LABEL[b]}));
+        header.appendChild(th);
+        tbody.appendChild(header);
+        for (const m of metrics) {
+          const rr = el("tr");
+          rr.appendChild(el("td",{text:m.label}));
+          ASSETS_FOR_TABLE.forEach(function(a){
+            yearsAvail.forEach(function(y, yIdx){
+              const v = valueFor(a, y, b, m);
+              const td = el("td",{cls:"num",text:formatVal(v, m.fmt),
+                style: yIdx===0 ? "border-left:1px solid var(--border);" : ""});
+              rr.appendChild(td);
+            });
+          });
+          tbody.appendChild(rr);
         }
-        tbody.appendChild(rr);
       }
+      table.appendChild(tbody);
+    } else {
+      // ── Single-year layout (original) ──
+      const y = parseInt(ySel);
+      const tr = el("tr");
+      tr.appendChild(el("th",{text:"Metric"}));
+      ASSETS_FOR_TABLE.forEach(function(a){ tr.appendChild(el("th",{cls:"num",text:a})); });
+      thead.appendChild(tr); table.appendChild(thead);
+      const tbody = el("tbody");
+      const bases = [["Net","net"], ["Gross","gross"]];
+      for (const [b, cls] of bases) {
+        const header = el("tr");
+        const th = el("td",{style:"background:var(--panel2); font-weight:700;",attrs:{colspan:"6"}});
+        th.appendChild(el("span",{cls:"badge "+cls, text:BASIS_LABEL[b]}));
+        header.appendChild(th);
+        tbody.appendChild(header);
+        for (const m of metrics) {
+          const rr = el("tr");
+          rr.appendChild(el("td",{text:m.label}));
+          ASSETS_FOR_TABLE.forEach(function(a){
+            const v = valueFor(a, y, b, m);
+            rr.appendChild(el("td",{cls:"num",text:formatVal(v, m.fmt)}));
+          });
+          tbody.appendChild(rr);
+        }
+      }
+      table.appendChild(tbody);
     }
-    table.appendChild(tbody);
+
     panel.appendChild(table);
     wrap.appendChild(panel);
   };
@@ -3053,9 +3130,27 @@ const renderFns = {
   exceptions: renderExceptions, methodology: renderMethodology,
 };
 const rendered = {};
+// Per-tab max-width: each tab uses an appropriate horizontal envelope for its content.
+// Wider for dense tables (Monthly LOS, Annual Total LOE); narrower for prose tabs
+// (Methodology, Exceptions); default for KPI/chart tabs.
+const TAB_MAX_WIDTH = {
+  summary:     "1500px",
+  trends:      "1500px",
+  insights:    "1500px",
+  annual:      "1800px",
+  gross:       "1800px",
+  monthly:     "1800px",
+  scaling:     "1800px",
+  joint:       "1400px",
+  exceptions:  "1100px",
+  methodology: "1100px",
+};
 function switchTab(name) {
   document.querySelectorAll("#topnav button").forEach(function(b){ b.classList.toggle("active", b.dataset.tab===name); });
   document.querySelectorAll(".tab-content").forEach(function(t){ t.classList.toggle("active", t.id==="tab-"+name); });
+  // Apply per-tab max-width to the main container
+  const container = document.querySelector(".container");
+  if (container) container.style.maxWidth = TAB_MAX_WIDTH[name] || "1600px";
   if (!rendered[name]) { renderFns[name](); rendered[name] = true; }
 }
 document.querySelectorAll("#topnav button").forEach(function(b){
